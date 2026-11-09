@@ -2,7 +2,7 @@
 #
 # PencariMovie Server - Alpine (musl) image.
 #
-#   docker build -f Dockerfile.rust -t pencarimovie-server .
+#   docker build -f Dockerfile -t pencarimovie-server .
 #   docker run --rm -p 8088:8088 -v pmdata:/data pencarimovie-server
 #
 # The whole server is ONE binary: `public/` is embedded at compile time
@@ -46,8 +46,25 @@ COPY desktop ./desktop
 # cache mounts made the template undeployable. A plain RUN costs a full recompile
 # on each source build and works everywhere. CI does not use this file: the
 # release pipeline builds `Dockerfile.release` (COPY-only, from a prebuilt
-# musl binary).
-RUN cargo build --release --locked \
+# glibc binary).
+#
+# This file is the Heroku / one-click / `docker-compose.dev.yml` path: it
+# compiles for the host arch with no cross-compilation, so the `uname -m` guard
+# below is enough and no buildx/QEMU is involved.
+# Pin the ISA baseline for x86_64. 3.0.x containers died with SIGILL (exit 132)
+# about a second after the banner on any CPU without AVX2 — which is every
+# Synology x86 NAS (Atom C2538/C3538, Celeron J4125/J4025, N4000) and every
+# pre-2013 desktop. The x86-64 baseline is already rustc's default for this
+# target, so stating it explicitly cannot change a correct build; it stops a
+# polluted build host (RUSTFLAGS, a stale ~/.cargo/config.toml) from silently
+# raising it, which is exactly how the released artifacts broke. Never use
+# `native` here. `uname -m` is the build/target arch: nothing in this file
+# cross-compiles.
+RUN set -eux; \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+      export RUSTFLAGS="-C target-cpu=x86-64 -C target-feature=-avx,-avx2,-fma,-f16c"; \
+    fi; \
+    cargo build --release --locked \
  && cp target/release/pencarimovie-server /usr/local/bin/pencarimovie-server
 
 FROM alpine:3.20

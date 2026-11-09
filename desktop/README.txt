@@ -55,7 +55,9 @@ First run
      (or open http://127.0.0.1:8088/#addon and use the buttons)
 
 LAN / TV access
-  bind to all interfaces:  ./pencarimovie-server --host 0.0.0.0
+  The server binds all interfaces (0.0.0.0) by default on every platform,
+  so a TV or other device on the same Wi-Fi / LAN can reach it immediately.
+  Loopback only (restrict to this machine):  --host 127.0.0.1  (or env PM_LISTEN_HOST=127.0.0.1)
   the dashboard footer / /api/lan-ip show the LAN URL to install on a TV box.
 
 Flags

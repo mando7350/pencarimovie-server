@@ -18,6 +18,7 @@
 //! divides that offset and does not cross a 1 MB boundary, so every
 //! `upload.getFile` call satisfies Telegram's alignment rules.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -42,7 +43,7 @@ use crate::session::{
     pick_pool_bot,
 };
 use crate::storage::now;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Live transfer counters, read by `/api/diagnostics` and used by the Android
 /// app to drive its notification indicator and battery saver from real activity
@@ -50,12 +51,63 @@ use std::sync::OnceLock;
 /// holding a wake lock forever.
 static ACTIVE_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ACTIVE_PREFLIGHTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REFUSED_429: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Distinct short codes with a live body. The per-code count is why two bodies
+/// of one film cost one title: a seek and a segmented download open the same code.
+static ACTIVE_TITLES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
 
 pub fn active_streams() -> usize {
     ACTIVE_STREAMS.load(std::sync::atomic::Ordering::Relaxed)
 }
 pub fn active_preflights() -> usize {
     ACTIVE_PREFLIGHTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn refused_429() -> usize {
+    REFUSED_429.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn active_titles() -> usize {
+    titles_map().len()
+}
+
+fn titles_map() -> std::sync::MutexGuard<'static, HashMap<String, u32>> {
+    let map = ACTIVE_TITLES.get_or_init(|| Mutex::new(HashMap::new()));
+    match map.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+/// One live body for a short code. The entry disappears when the last body for
+/// that code ends, so a cancelled stream cannot leave a title behind.
+struct TitleGuard(String);
+
+impl TitleGuard {
+    fn new(short_code: &str) -> Self {
+        if !short_code.is_empty() {
+            *titles_map().entry(short_code.to_string()).or_insert(0) += 1;
+        }
+        TitleGuard(short_code.to_string())
+    }
+}
+
+impl Drop for TitleGuard {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        let mut map = titles_map();
+        let last = match map.get_mut(&self.0) {
+            Some(n) => {
+                *n = n.saturating_sub(1);
+                *n == 0
+            }
+            None => false,
+        };
+        if last {
+            map.remove(&self.0);
+        }
+    }
 }
 
 /// Decrements its counter when dropped, including on every early `return`
@@ -161,9 +213,132 @@ fn prime_window(start: u64, aligned: u64, total: u64, file_size: u64) -> (u64, u
     (skip0, want)
 }
 
+/// Fetch the preflight range in PARALLEL whenever it needs more than one part.
+///
+/// WHICH requests this affects: `prime_window()` hands back 512 KB only when
+/// `start` sits exactly on a 1 MB boundary (byte 0, or a whole-MB offset). Every
+/// other range, which is every seek and every partial read a player sends,
+/// rounds the head up to 1 MB. `fetch_range_core()` holds ONE permit for the
+/// whole call, so that head was two 512 KB parts fetched back to back and the
+/// player waited for both before byte one. Measured here against a 406 MB 4K
+/// source, 4 MB range windows at 1 MB-block offsets, median of 8 rounds: first
+/// byte **954 ms serial, 723 ms split**. A byte-0 prefix still measures the same
+/// on both builds, because it was never two parts to begin with
+/// (`prefix_range_takes_no_skip`).
+///
+/// COST, stated because the part budget is shared by every viewer on the
+/// connection: the split holds 2 permits at once instead of 1, for half as long.
+/// Part-seconds are unchanged, so a neighbouring stream loses a slot for one RTT
+/// rather than two. Under `--inflight 1` the two futures simply queue, and the
+/// result is byte-identical to the serial fetch.
+async fn fetch_prime_gated(
+    client: &grammers_client::Client,
+    gate: &tokio::sync::Semaphore,
+    target: &DocTarget,
+    pos: u64,
+    want: u64,
+) -> Result<Vec<u8>, crate::telegram::GramErr> {
+    // BOUNDED, because this gate is shared with every other stream on the
+    // connection and `fetch_range_core` waits for a permit FOREVER ("requests
+    // queue, they never fail").
+    //
+    // MEASURED 2026-11-08 19:33–19:34 UTC on v31: 31 of 100 `/api/download`
+    // requests were killed by Heroku's router at 30 s (`H12`) and **8 of those
+    // 31 were music** — `The.Weeknd.Out.of.Time.flac` (49 MB),
+    // `04.BIRDS.OF.A.FEATHER.Explicit.flac` (41 MB), `PinkPantheress.Illegal.flac`
+    // and others — while the dyno's 32 parts were all streaming something else.
+    // A queued first byte has to become a fast, retryable answer instead of a
+    // 30 s hang the router turns into a 503 the player cannot retry.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PRIME_GATE_WAIT_SECS),
+        prime_parts(client, gate, target, pos, want),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(crate::telegram::GramErr {
+            message: format!(
+                "{GATE_BUSY_PREFIX}: {}s waiting for a part permit",
+                PRIME_GATE_WAIT_SECS
+            ),
+            ..Default::default()
+        }),
+    }
+}
+
+/// The prime itself, with no timeout: two parts in parallel when the head spans
+/// more than one Telegram part, one otherwise.
+async fn prime_parts(
+    client: &grammers_client::Client,
+    gate: &tokio::sync::Semaphore,
+    target: &DocTarget,
+    pos: u64,
+    want: u64,
+) -> Result<Vec<u8>, crate::telegram::GramErr> {
+    let (want, split) = prime_split(want);
+    let Some((first_want, second_want)) = split else {
+        return crate::telegram::fetch_range_gated(client, gate, target, pos, want).await;
+    };
+    // `pos` arrives 4096-aligned (it is `aligned`) and `MAX_CHUNK` is a whole
+    // number of `MIN_CHUNK` units, so `second_pos` stays legal for `plan_limit()`.
+    // Mis-align it and every following window collapses to 4 KB parts.
+    let second_pos = pos.saturating_add(first_want);
+    log(
+        "preflight prime split across two parts",
+        &serde_json::json!({"pos": pos, "first": first_want, "second": second_want}),
+    );
+    let (mut first, second) = tokio::try_join!(
+        crate::telegram::fetch_range_gated(client, gate, target, pos, first_want),
+        crate::telegram::fetch_range_gated(client, gate, target, second_pos, second_want),
+    )?;
+    first.extend_from_slice(&second);
+    Ok(first)
+}
+
+/// `(clamped_want, Some((first, second)))`, or `(clamped_want, None)` when one
+/// Telegram part already covers the head.
+///
+/// The 1 MB cap is applied HERE and not trusted from the caller. Without it, a
+/// head above 1 MB would hand `fetch_range_core()` a `second` overrun, and it
+/// answers an overrun by fetching the extra parts SERIALLY inside the same
+/// permit: no error, no log, and the latency this function exists to remove is
+/// back. `PRIME_BYTES` is the knob that would do it, so the guard sits next to
+/// the arithmetic instead of riding on `prime_window()`'s `.min(MB)`.
+/// How long a first byte may queue for a part permit before the request is
+/// answered "busy, retry" ([`GATE_BUSY_PREFIX`]) instead of hanging into the
+/// platform router's 30 s timeout.
+///
+/// A 1 MB part is fetched in well under a second at the measured rates, so a
+/// wait this long means the connection is saturated — but waiting is still the
+/// better answer than refusing: MEASURED 2026-11-09 at 6 s, the fleet turned 17
+/// streams in 34 s into `parts busy` 503s (4 of 22 music files got nothing else),
+/// and a player that does not retry reads that as "this song will not play".
+/// 12 s halves that queue, and the router only kills the request at 30 s, which
+/// still leaves room for the part fetch and the headers after the wait.
+pub const PRIME_GATE_WAIT_SECS: u64 = 12;
+
+/// Prefix of the error that means "every part on this connection is busy". The
+/// pre-flight loop stops retrying on it (four retries would spend four wait
+/// budgets on the same saturation) and the handler answers `503` +
+/// `Retry-After`, which a player can act on.
+pub const GATE_BUSY_PREFIX: &str = "parts busy";
+
+fn prime_split(want: u64) -> (u64, Option<(u64, u64)>) {
+    let want = want.min(crate::telegram::MB);
+    if want <= crate::telegram::MAX_CHUNK {
+        return (want, None);
+    }
+    (want, Some((crate::telegram::MAX_CHUNK, want - crate::telegram::MAX_CHUNK)))
+}
+
 /// One fetch window, clamped so it never asks past the last byte. A window that
 /// over-runs EOF makes Telegram error and the body dies short of the
 /// `Content-Length` already sent.
+///
+/// How many times one window inside a LIVE BODY is retried before the body is
+/// given up. Small on purpose: this covers a blip, not a dead file.
+pub const BODY_WINDOW_ATTEMPTS: u32 = 3;
+
 fn window(p: u64, want: u64, file_size: u64) -> Option<(u64, u64)> {
     let avail = file_size.saturating_sub(p);
     let w = want.min(avail);
@@ -592,6 +767,70 @@ fn record_refusal(
     );
 }
 
+/// Answer a per-client abuse refusal (`ratelimit`).
+///
+/// Always `429` + `Retry-After`: a player reads `5xx` and `404` as fatal and never
+/// retries, while `403` reads as "your account is gone" — AGENTS.md is explicit that
+/// a rate limit must answer 429. `Retry-After` is what makes a well-behaved client
+/// back off instead of hammering, which would keep its own budget spent.
+fn refuse_limit(
+    ctx: &ReqCtx,
+    started: std::time::Instant,
+    refusal: crate::ratelimit::Refusal,
+    short_code: &str,
+) -> Response {
+    REFUSED_429.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let retry = refusal.retry_after.max(1);
+    record_refusal(
+        ctx,
+        started,
+        429,
+        refusal.error,
+        refusal.message,
+        short_code,
+        serde_json::json!({"retry_after": retry}),
+    );
+    let body = serde_json::json!({
+        "ok": 0,
+        "error": refusal.error,
+        "message": refusal.message,
+        "retry_after": retry,
+    });
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::RETRY_AFTER, retry.to_string())
+        .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
+        .unwrap_or_else(|_| json_response(429, &body))
+}
+
+/// What an empty resolve MEANS.
+///
+/// A short_code that resolved to nothing is the client's fault only when the origin
+/// ANSWERED. When it never answered — DNS, TCP, timeout — the fault is upstream, and
+/// saying so is the whole difference between a recoverable stream and a dead one:
+/// ExoPlayer retries a `5xx` on its own, while it renders a `400` verbatim as
+/// `HTTP 400 Bad Request [ERROR_CODE_IO_BAD_HTTP_STATUS]` and gives up. Measured on a
+/// phone (2026-11-02) where the origin timed out: every play showed exactly that 400.
+///
+/// ponytail: reads the 20 s origin gate, so a genuine miss arriving right after an
+/// outage also answers 503 for at most those 20 s — the retry gets the real 400/404.
+fn empty_resolve_refusal(origin_down_secs: i64) -> (u16, &'static str, &'static str) {
+    if origin_down_secs > 0 {
+        (
+            503,
+            crate::httpc::ORIGIN_UNREACHABLE,
+            crate::httpc::ORIGIN_UNREACHABLE_MSG,
+        )
+    } else {
+        (
+            400,
+            "MISSING_FILE_ID",
+            "file_id or valid short_code is required for local browser download.",
+        )
+    }
+}
+
 pub fn plan_download_candidates(
     bot_id: &str,
     short_code: &str,
@@ -637,6 +876,17 @@ pub fn plan_download_candidates(
         bot_id.to_string()
     };
     (chosen_bot, candidates)
+}
+
+/// Wall-clock second this process started.
+///
+/// A Telegram `file_reference` is bound to the session that minted it, so an id
+/// stamped before this instant cannot be used by this process at all — the
+/// session that owned it is gone. Lazily fixed at the first download, which is
+/// also the first moment the value matters.
+fn boot_at() -> i64 {
+    static BOOT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *BOOT.get_or_init(now)
 }
 
 pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
@@ -771,8 +1021,30 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             // gets 20 minutes; one that was never fetched yet (prewarm output)
             // gets 10, because nobody has checked it.
             let stamped = if verified > 0 { verified } else { resolved };
-            let window = if verified > 0 { 1200 } else { 600 };
-            let fresh_enough = stamped > 0 && now() - stamped < window;
+            // An id stamped by a PREVIOUS process is dead no matter how young it
+            // looks: a `file_reference` is bound to the session that minted it, and
+            // a restart opens a new one. MEASURED 2026-11-07 after the fix above:
+            // the only remaining `FILE_REFERENCE_EXPIRED` in the log was `ONtzzQ`,
+            // a bare `range:""` request fired immediately after
+            // `telegram session resumed`. 18 bodies served, that one failure.
+            let from_this_process = stamped >= boot_at();
+            // MEASURED 2026-11-07 on the production build, from the live log: 7 of
+            // 7 Eclipse plays started from an UNVERIFIED cached id and every one of
+            // them died with `FILE_REFERENCE_EXPIRED (400)` before the first byte,
+            // then recovered on a forced re-resolve — and the client had already
+            // moved to the next song by then. That failure IS the "it skips the
+            // song" symptom, so the 600 s trust window for an unverified id was
+            // 600 s too generous: a `file_reference` is minted per send and is
+            // dead long before the resolve answer is 10 minutes old.
+            //
+            // An unverified id is therefore NEVER fresh enough. It is dropped here
+            // and the normal resolve mints a live reference: one origin call
+            // (~0.4 s measured) instead of a guaranteed 400 plus a recovery the
+            // player does not wait for. A PROVEN id (verified_at > 0) keeps its
+            // 20-minute window — those are the ones that actually stream.
+            let window = if verified > 0 { 1200 } else { 0 };
+            let fresh_enough =
+                stamped > 0 && from_this_process && now() - stamped < window;
             if !cached_id.is_empty() && !(fresh_enough && same_bot) {
                 // Drop it, or the resolve below hands the same dead reference
                 // straight back and the Play fails on the first byte.
@@ -811,6 +1083,59 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
     }
 
+    /* ── per-client abuse limits ────────────────────────────────────────── */
+    // Checked HERE, not at request entry: by now the short code (or the minted
+    // file_id) is known, so a seek, a segmented download and a preload of the SAME
+    // file fold onto one slot instead of spending the client's whole budget. That
+    // is what keeps a 16-connection download manager and a scrub bar from ever
+    // looking like a scraper — see `ratelimit.rs`.
+    //
+    // The guard MUST travel with the response body (it is moved into the streaming
+    // task far below). Released when this function returns, it would cap *requests*
+    // rather than live streams: the player's next Range request would be refused
+    // while the first is still being served.
+    let mut limit_guard: Option<crate::ratelimit::Guard> = None;
+    if let Some(limit_key) = crate::ratelimit::client_key(ctx) {
+        let limit_code = if short_code.is_empty() {
+            file_id.clone()
+        } else {
+            short_code.clone()
+        };
+        match state.limits.acquire(
+            &limit_key,
+            &limit_code,
+            state.max_titles_per_ip,
+            state.max_bodies_per_ip,
+        ) {
+            Ok(g) => limit_guard = Some(g),
+            Err(r) => return refuse_limit(ctx, started, r, &short_code),
+        }
+        // A COLD start is the only thing that costs the origin a resolve, so it is
+        // the only thing charged. A seek, a bare `Range` request and a replay of a
+        // warm short code arrive here with `file_id` already set and pay nothing.
+        // A request with neither a code nor a payload is a 400 on the next branch,
+        // not a resolve, so it is not charged either.
+        let has_work = !short_code.is_empty() || !encoded.is_empty();
+        if file_id.is_empty() && has_work {
+            if let Err(wait) = state.limits.check_cold(
+                &limit_key,
+                state.cold_starts_per_ip,
+                state.cold_start_window,
+            ) {
+                return refuse_limit(
+                    ctx,
+                    started,
+                    crate::ratelimit::Refusal {
+                        error: "IP_COLD_START_LIMIT",
+                        message: "Too many new streams from this address. Please retry shortly.",
+                        retry_after: wait,
+                    },
+                    &short_code,
+                );
+            }
+        }
+    }
+
     log(
         "download request received",
         &serde_json::json!({
@@ -829,6 +1154,33 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             "range": ctx.hdr("range"),
         }),
     );
+
+    // Nothing to serve is a CLIENT error, and it must not depend on the session.
+    //
+    // This check lived after `auto_provision_guest`, so a request carrying no file
+    // id at all could spend a provision, or answer `503 Connecting guest bot in
+    // progress` while one was starting, instead of the 400 the caller can act on.
+    // The 30 s provision wait hid it; the cold-start gate caught it the moment that
+    // wait became 3 s, with `/api/download` itself as the caller.
+    if file_id.is_empty() && short_code.is_empty() && encoded.is_empty() {
+        record_refusal(
+            ctx,
+            started,
+            400,
+            "MISSING_FILE_ID",
+            "file_id or valid short_code is required for local browser download.",
+            &short_code,
+            serde_json::json!({"payload_len": 0, "bot_id": get_bot_id(), "pool_bots": 0}),
+        );
+        return json_response(
+            400,
+            &serde_json::json!({
+                "ok": 0,
+                "message": "file_id or valid short_code is required for local browser download.",
+                "hint": "Pass a Bot API file id or shortcode to resolve the file.",
+            }),
+        );
+    }
 
     let mut active_bot = get_bot_id();
     if !has_local_session("") {
@@ -1010,24 +1362,34 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     }
 
     if file_id.is_empty() {
+        let down = crate::httpc::wp_origin_down_secs();
+        let (status, stage, message) = empty_resolve_refusal(down);
         record_refusal(
-            ctx, started, 400, "MISSING_FILE_ID",
-            "file_id or valid short_code is required for local browser download.",
-            &short_code,
+            ctx, started, status, stage, message, &short_code,
             serde_json::json!({
                 "payload_len": encoded.len(),
                 "bot_id": bot_id,
                 "pool_bots": candidates.len(),
+                "origin_down_secs": down,
             }),
         );
-        return json_response(
-            400,
-            &serde_json::json!({
-                "ok": 0,
-                "message": "file_id or valid short_code is required for local browser download.",
-                "hint": "Pass a Bot API file id or shortcode to resolve the file.",
-            }),
-        );
+        let body = serde_json::json!({
+            "ok": 0,
+            "error": stage,
+            "message": message,
+            "short_code": short_code,
+            "retry_after": down,
+            "hint": "Pass a Bot API file id or shortcode to resolve the file.",
+        });
+        if status == 503 {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, down.max(1).to_string())
+                .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
+                .unwrap_or_else(|_| json_response(503, &body));
+        }
+        return json_response(400, &body);
     }
 
     file_name = stream_filename(&file_name, &file_mime);
@@ -1320,9 +1682,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             );
             break;
         }
-        match crate::telegram::fetch_range_gated(&client, client_gate.as_ref(), &target, aligned, prime_want)
-            .await
-        {
+        match fetch_prime_gated(&client, client_gate.as_ref(), &target, aligned, prime_want).await {
             Ok(buf) => {
                 first = Some(buf);
                 break;
@@ -1337,6 +1697,13 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         "short_code": short_code,
                     }),
                 );
+                // Saturation is not a dead file: four attempts would each spend
+                // their own wait budget on the same full connection. Stop and let
+                // the handler answer a retryable 503.
+                if e.message.starts_with(GATE_BUSY_PREFIX) {
+                    last_err = Some(e);
+                    break;
+                }
                 let file_ref = e.file_reference;
                 last_err = Some(e);
                 if file_ref && !short_code.is_empty() {
@@ -1482,11 +1849,41 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     }
                     continue;
                 }
-                // Not a reference error: re-boot the session and retry.
+                // Not a reference error: a TRANSPORT reset. grammers reports it
+                // as `request error: read 0 bytes` / `reset by peer` /
+                // `broken pipe` — the TCP connection to the datacentre went away
+                // mid-read, which the file itself has nothing to do with.
+                //
+                // MEASURED 2026-11-08 from the live log: one music short_code
+                // (`o7miXT`) failed attempts 1, 2 and 3 inside six seconds with
+                // that same message and the player stalled, because the old code
+                // here called `boot()` and `boot()` hands back the pooled entry
+                // UNCHANGED when no token is given ([`crate::telegram`] line 462),
+                // so the retry ran instantly on the worker slot that had just
+                // died. Rotate the slot and let the reconnect breathe.
                 if let Ok(e) = state.telegram.boot(&bot_id, None).await {
                     let (c, g) = e.pick_slot();
                     client = c;
                     client_gate = g;
+                }
+                if attempt < max_attempts {
+                    let ms = 250u64 * attempt as u64;
+                    log(
+                        "transport reset - rotating the worker before the next attempt",
+                        &serde_json::json!({
+                            "short_code": short_code,
+                            "attempt": attempt,
+                            "wait_ms": ms,
+                            "transport": last_err.as_ref().map(|e| e.transport).unwrap_or(false),
+                        }),
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    // A retry that survived a dead connection is progress, so it
+                    // gets its own window (bounded by the hard cap) — same rule as
+                    // the reference-expiry path above.
+                    preflight_deadline = (std::time::Instant::now()
+                        + std::time::Duration::from_secs(PREFLIGHT_BUDGET_SECS))
+                        .min(hard_deadline);
                 }
             }
         }
@@ -1506,6 +1903,44 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 "flood_wait": err.flood_wait,
             }),
         );
+        // EVERY PART ON THIS CONNECTION IS BUSY. 503 + `Retry-After` is the one
+        // answer a player can act on: a 500 reads as "this track is broken" and
+        // the platform router's own 30 s `H12` gives the client nothing at all.
+        if err.message.starts_with(GATE_BUSY_PREFIX) {
+            let retry_after = 3;
+            record_refusal(
+                ctx,
+                started,
+                503,
+                "PARTS_BUSY",
+                &err.message,
+                &short_code,
+                serde_json::json!({"retry_after": retry_after, "bot_id": bot_id}),
+            );
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, retry_after.to_string())
+                .body(Body::from(
+                    serde_json::json!({
+                        "ok": 0,
+                        "message": "Every streaming slot is busy, please retry shortly.",
+                        "retry_after": retry_after,
+                        "short_code": short_code,
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_else(|_| {
+                    json_response(
+                        503,
+                        &serde_json::json!({
+                            "ok": 0,
+                            "message": "Every streaming slot is busy, please retry shortly.",
+                            "retry_after": retry_after,
+                        }),
+                    )
+                });
+        }
         // A rate limit is a 429, never a 5xx/404: a client reads those as fatal
         // and never retries (root AGENTS.md: "A rate limit must answer 429").
         if let Some(secs) = err.flood_wait {
@@ -1623,8 +2058,17 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // Held for the whole body, so `--max-streams` covers the live stream and
         // is released when this task ends (completed, aborted, or client gone).
         let _stream_permit = stream_permit;
+        // Same lifetime rule for the per-client slot: the counter must cover the
+        // LIVE BODY, so it is released when this task ends, not when the handler
+        // returned. That end is prompt but NOT instant — `tx.is_closed()` is checked
+        // before the next window fetch, so a cancelled body (a seek, a closed tab)
+        // can hold its slot for up to one window. The default title cap is 8 rather
+        // than 1 or 2 for exactly that reason: overlap must never be able to look
+        // like abuse.
+        let _limit_guard = limit_guard;
         // Reported to the app as "streaming" activity for the whole body.
         let _activity = ActivityGuard::new(&ACTIVE_STREAMS);
+        let _titles = TitleGuard::new(&short_code_for_task);
         // PIPELINE the chunks: fetch up to `pipeline_depth()` 1 MB windows
         // concurrently and emit them IN ORDER (`StreamExt::buffered`). Fetching one
         // chunk at a time made every megabyte pay a full Telegram round-trip —
@@ -1731,10 +2175,50 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             let entry = entry_for_task.clone();
             let target = target_for_task.clone();
             async move {
-                let (client, gate) = entry.pick_slot();
-                let res =
-                    crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, p, w).await;
-                (i, res)
+                // ONE BLINK MUST NOT KILL THE TRACK.
+                //
+                // MEASURED 2026-11-09 from the live log: in 42 s, 27 distinct
+                // audio files were requested and EVERY one answered 200/206, yet
+                // nine bodies died mid-stream (`download stream aborted mid-body`)
+                // — which a player sees as "this song is broken" even though it
+                // had the right rows and the right bytes started arriving.
+                //
+                // The pre-flight gives up fast on purpose (the router kills the
+                // request at 30 s), but a window INSIDE a body is different: the
+                // client already holds the headers and the `Content-Length`, so a
+                // short pause is recoverable and aborting is not. Retry only what
+                // means "busy" or "the connection blinked"; a dead file reference
+                // is still final.
+                let mut attempt = 0u32;
+                loop {
+                    let (client, gate) = entry.pick_slot();
+                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, p, w)
+                        .await
+                    {
+                        Ok(v) => return (i, Ok(v)),
+                        Err(e) => {
+                            attempt += 1;
+                            let retryable =
+                                e.transport || e.message.starts_with(GATE_BUSY_PREFIX);
+                            if !retryable || attempt >= BODY_WINDOW_ATTEMPTS {
+                                return (i, Err(e));
+                            }
+                            log(
+                                "download stream retrying a window",
+                                &serde_json::json!({
+                                    "attempt": attempt,
+                                    "error": e.message,
+                                    "pos": p,
+                                    "wait_ms": 150 * attempt as u64,
+                                }),
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                150 * attempt as u64,
+                            ))
+                            .await;
+                        }
+                    }
+                }
             }
         }))
         .buffered(pipeline);
@@ -1856,6 +2340,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_titles_tracks_guard_lifetime() {
+        let before = active_titles();
+        {
+            let _a = TitleGuard::new("title_guard_lifetime");
+            assert_eq!(active_titles(), before + 1);
+            let _b = TitleGuard::new("title_guard_lifetime");
+            assert_eq!(active_titles(), before + 1, "two bodies of one code count once");
+        }
+        assert_eq!(active_titles(), before, "the title leaves when its last body ends");
+        // A request with no short code is not a title and must not add an entry.
+        {
+            let _empty = TitleGuard::new("");
+            assert_eq!(active_titles(), before);
+        }
+    }
+
+    #[test]
     fn guesses_video_mime_when_omitted() {
         let name = "Sengkolo.Petaka.Satu.Suro.2026.1080p.MalaySub.WEB.MSM.mp4";
         let mime = guess_video_mime(name, "");
@@ -1938,6 +2439,60 @@ mod tests {
         assert_eq!((aligned + want) % crate::telegram::MB, 0);
     }
 
+    /// The split must never be reachable with a segment larger than one part,
+    /// and must cover exactly the requested head.
+    #[test]
+    fn prime_split_covers_the_head_in_legal_parts() {
+        use crate::telegram::{MAX_CHUNK, MB, MIN_CHUNK};
+
+        // Whatever a 1 MB-aligned start can produce is one part: no split.
+        for want in [1u64, MIN_CHUNK, PRIME_BYTES, MAX_CHUNK] {
+            let (clamped, split) = prime_split(want);
+            assert_eq!((clamped, split), (want, None), "want={want} fits one part");
+        }
+
+        // Every other start rounds the head up to 1 MB: exactly two parts.
+        assert_eq!(prime_split(MB), (MB, Some((MAX_CHUNK, MAX_CHUNK))));
+
+        // A head cut short by EOF keeps the remainder exact rather than rounded.
+        let (clamped, split) = prime_split(700_000);
+        assert_eq!(clamped, 700_000);
+        assert_eq!(split, Some((MAX_CHUNK, 700_000 - MAX_CHUNK)));
+
+        // The cap is enforced here, so a future `PRIME_BYTES` bump cannot push
+        // an overrun into `fetch_range_core()`'s serial fallback.
+        assert_eq!(prime_split(4 * MB).0, MB);
+        assert_eq!(prime_split(4 * MB).1, Some((MAX_CHUNK, MAX_CHUNK)));
+
+        // Why `second_pos` stays 4096-aligned without recomputing it.
+        assert_eq!(MAX_CHUNK % MIN_CHUNK, 0);
+    }
+
+    /// Ties the real player shapes to whether the split engages at all. A byte-0
+    /// prefix is the one everyday case that gets no benefit, and saying so here
+    /// stops a future "this did nothing" report from looking like a regression.
+    #[test]
+    fn only_one_part_heads_skip_the_split() {
+        use crate::telegram::{MAX_CHUNK, MB};
+
+        let (aligned, _skip0, want) = plan_for(0, 1_048_575);
+        assert_eq!(aligned, 0);
+        assert_eq!(want, PRIME_BYTES);
+        assert_eq!(prime_split(want).1, None, "a 0-based prefix primes one part");
+
+        // A plain range inside the file, and a seek, both round up to 1 MB.
+        for start in [900_000_000u64, 11_000_003] {
+            let (_aligned, skip0, want) = plan_for(start, start + 1_048_575);
+            assert!(skip0 > 0);
+            assert_eq!(want, MB, "start={start} rounds the head up");
+            assert_eq!(
+                prime_split(want).1,
+                Some((MAX_CHUNK, want - MAX_CHUNK)),
+                "start={start} must use the parallel path"
+            );
+        }
+    }
+
     #[test]
     fn head_never_leaves_a_part_hostile_offset() {
         // `start = aligned + 1` measured 245 KB/s before the head was rounded,
@@ -1965,6 +2520,16 @@ mod tests {
         // A window well inside the file is untouched.
         assert_eq!(window(0, crate::telegram::MB, REAL_SIZE),
                    Some((0, crate::telegram::MB)));
+    }
+
+    /// The one behaviour this change exists for: an outage must not be reported as a
+    /// client error, because the player does not retry a 400.
+    #[test]
+    fn an_unreachable_origin_is_a_503_not_a_missing_file_id() {
+        let (status, stage, _) = empty_resolve_refusal(20);
+        assert_eq!((status, stage), (503, "ORIGIN_UNREACHABLE"));
+        let (status, stage, _) = empty_resolve_refusal(0);
+        assert_eq!((status, stage), (400, "MISSING_FILE_ID"));
     }
 
     #[test]

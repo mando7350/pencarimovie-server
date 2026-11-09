@@ -25,6 +25,10 @@ if not defined PM_DIR (
     exit /b 1
 )
 
+rem Bind all interfaces unless the user chose one, so the LAN/TV add-on URL works
+rem on a fresh start. `--host 127.0.0.1` still wins (flags beat the environment).
+if not defined PM_LISTEN_HOST if not defined HOST set "PM_LISTEN_HOST=0.0.0.0"
+
 if /i "%~1"=="stop"       goto do_stop
 if /i "%~1"=="--stop"     goto do_stop
 if /i "%~1"=="restart"    goto do_restart
@@ -122,7 +126,7 @@ if exist "%PM_DIR%\.git" (
     exit /b 1
 )
 echo This stops the server, removes the Windows startup entry and deletes:
-echo   %PM_DIR%
+echo   %PM_ABS%
 echo.
 if /i not "%~2"=="--yes" (
     set /p "CONFIRM=Continue? [y/N] "
@@ -133,12 +137,7 @@ if /i not "%~2"=="--yes" (
 )
 call "%~f0" stop >nul 2>&1
 del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PencariMovie.vbs" >nul 2>&1
+powershell -NoProfile -Command "$p=[Environment]::GetEnvironmentVariable('Path','User'); if($p){$n=(@($p -split ';') | Where-Object { $_ -ne '' -and $_ -ne '%PM_ABS%' }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $n, 'User')}" >nul 2>&1
 cd /d "%TEMP%"
-rd /s /q "%PM_DIR%" >nul 2>&1
-if exist "%PM_DIR%" (
-    echo Stopped and removed the startup entry, but the folder could not be fully
-    echo deleted. Remove it manually:  %PM_DIR%
-    exit /b 1
-)
-echo Uninstalled. %PM_DIR% is gone.
-exit /b 0
+echo Uninstalled. %PM_ABS% is gone.
+(goto) 2>nul & rd /s /q "%PM_ABS%"

@@ -4,8 +4,92 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
 
 ## [Unreleased]
 
+### Fixed
+
+- **`curl -fsSL telegra.my/linux | sh` never came back to the prompt.** The Linux and macOS
+  installers are one shared payload whose tail ended with `exec "$dir/start.sh"`, so the server
+  ran in the foreground, the piped script held the terminal, and the "Ctrl+C to stop" it printed
+  was the only way out. It now starts detached (via `setsid`, or `nohup` where there is none),
+  appends to `storage/server.log`, waits up to 20s for `/api/version` and prints the dashboard,
+  log and stop paths before returning; `PM_FOREGROUND=1` restores the old foreground behaviour.
+  It also writes the `stop.sh` that `pms stop`, the systemd unit and the macOS LaunchAgent already
+  call and that neither tarball ships, and explains the exposure of a non-loopback bind: a Cloud
+  Shell or Codespaces preview URL reaches the port from localhost, the engine trusts loopback, so
+  that URL needs no password at all. Launcher-side the duplicate banner is gone:
+  `PENCARIMOVIE_NO_BANNER=1` silences [`desktop/linux/start.sh`](desktop/linux/start.sh:35) and
+  [`desktop/macos/start.command`](desktop/macos/start.command:22), and `PM_NO_OPEN=1` stops the
+  macOS launcher opening a browser in the middle of an install.
+  [`cloudflare-worker-telegra-my.js`](cloudflare-worker-telegra-my.js:1) also normalises CRLF on
+  the way out now, because a Windows-saved copy of that file emitted `then\r` and a heredoc
+  terminator that matched nothing.
+- **3.0.x releases exited with `132` (SIGILL) a second after the banner on every CPU without
+  AVX2** — every Synology x86 NAS (Atom C2538/C3538, Celeron J4125/J4025, N4000) and every
+  desktop older than 2013. It is not a hardware limitation and not the reporter's fault: the
+  published x86_64 artifacts carried AVX2 instructions while the source does not ask for them.
+  A clean build of the same commit boots fine under `qemu-x86_64-static -cpu Nehalem`; the
+  released binaries (`ghcr.io/<repo>:latest`, the `linux-x86_64` tarball, and `v3.0.0`/`v3.0.3`
+  before them) do not, and both build flavours were affected, so the ISA level leaked in from the
+  build environment rather than from the dependency graph (2.9.9 is unaffected because it predates
+  PM-auth, whose first Ed25519/X25519 work is what hits the vector code, one line after
+  `pm-auth enrol ... enrolling install-wide`). Fixed at the pipeline: every x86_64 lane now pins
+  `-C target-cpu=x86-64` explicitly ([`.github/workflows/release.yml`](.github/workflows/release.yml:1),
+  [`Dockerfile`](Dockerfile:1)), and a new **Portability gate** boots both Linux artifacts under
+  `qemu-x86_64-static -cpu Nehalem` and requires `/api/version` to answer before anything is
+  uploaded, so an AVX2-only binary can no longer reach a release.
+
+### Security
+
+- **Six state-changing routes that had no gate now require the same machine or network, or a
+  token.** The auth system was applied per route, never globally, so a route simply forgot it and
+  nothing noticed. Every route that changes local state, spends an origin call, or returns a
+  credential is now gated: `POST /api/botlogout` (cleared
+  `session_meta`, `bot_id`, `bot_pool` and `api_secret`, so one anonymous POST stopped the whole
+  install until a bot was re-added), `POST /api/botlogin` (its success body carried
+  `api_secret`), `POST /api/catalog-settings` (rewrote `upstream_manifests`, so an attacker's
+  manifest could own every bridged catalog row, stream URL and subtitle), `GET /api/bots` and
+  `POST /api/bots/{add,remove,set-active}`, and `/api/debug-mode` plus `GET /api/logs` (the
+  switch that makes the log, with its short codes and origin URLs, readable). Two routes keep
+  their public half and lose their private half instead of closing entirely: `GET /api/session`
+  still answers `has_session` for the dashboard but blanks `bot_pool` and `bot_count`, and
+  `GET /api/tunnel/status` still reports `enabled` / `running` / `starting` / `error` but blanks
+  `tunnel_url`, `public_url`, `manifest_url` and `custom_domains`. The addon and player surface
+  stays open, because a Stremio client cannot send a header per request. The dashboard-driven
+  routes use a new `require_trusted_device()` ([`src/auth.rs`](src/auth.rs:251)) instead of
+  `require_privileged`: same machine or network, or a token. Each existing gate was wrong for
+  them in one direction. `require_privileged` refuses a LAN peer, which broke the dashboard
+  opened at `http://192.168.x.x:8088`: the page loads, the catalogs render, and then "Add bot"
+  and every catalog toggle answers 403 (measured on this box before the change). `require_auth`
+  closes nothing when no password is set, because it answers true for every caller in that
+  state, a tunnel included. A tunnel, a PaaS host or any proxied caller is still refused without
+  the token, since `is_local_request` checks that first. `/api/debug-mode` and `GET /api/logs`
+  stay machine-only, because the log they expose is not a dashboard feature. Pinned by
+  `tools/probe_auth_gates.mjs`, which calls each route as loopback, over the LAN address, and
+  with `cf-connecting-ip`: 21 checks across all three boundaries.
+
 ### Added
 
+- **`/api/download` now has per-client limits, and they count TITLES, not sockets.** Before
+  this there was no per-client limit at all: the token gate passes for every request when no
+  password is set or the caller is on the LAN, the concurrency gate (`--max-streams`) is
+  process-wide and defaults to uncapped, and the password lockout ladder is never consulted by
+  the download path. One address could therefore open hundreds of concurrent bodies and walk
+  the whole catalogue, each new title costing an origin `/resolve-file` relay and a Telegram
+  login. Three counters now live in [`src/ratelimit.rs`](src/ratelimit.rs:1):
+  `--max-titles-per-ip` (8, distinct short codes in flight), `--max-bodies-per-ip` (32, a
+  socket-flood backstop above every real download manager) and `--cold-starts-per-ip` (20 per
+  `--cold-start-window` 300 s, charged only where a resolve is actually issued). Each can be
+  set to `0` to turn that counter off; loopback, the LAN, link-local and CGNAT are exempt.
+  **The key is `(client, short_code)`, deliberately not `(client)`:** a seek, an `aria2 -x16` /
+  IDM / `yt-dlp` segmented download and a player preloading the next episode all produce
+  several bodies for ONE file, so counting sockets would have broken every real download.
+  Measured on real streams: 6 parallel bodies on one title answer
+  `206,206,206,206,206,206` with the title cap at `2`, while the 3rd concurrent _distinct_
+  title answers `429 IP_STREAM_LIMIT` with a `Retry-After` — never `403`/`503`/`404`. A
+  tunnelled request is never exempt: the key is `cf-connecting-ip`, else the **rightmost**
+  `x-forwarded-for` hop when a proxy is known to be in front (`PM_TRUST_XFF=1` or a PaaS host),
+  else the unforgeable peer address, with IPv6 collapsed to its `/64` so rotating `/128`s buys
+  nothing. Pinned by 21 tests in `ratelimit::tests`, `tools/probe_ip_limits.mjs` and
+  `tools/probe_stream_limits.mjs`.
 - **The dashboard header shows an update when the release feed has one.** A pill sits next
   to the version, and only when `/api/update/check` reports `update_available`: it opens a
   small card naming the path that works on that host — "Update now" (`POST
@@ -20,6 +104,15 @@ docker compose up -d` in a code block for a container, "install the newest APK" 
 
 ### Changed
 
+- **telegra.my is redesigned, and its Worker is now tracked.** The install page was five
+  glass cards with the platform name for a heading; it is now a mono synopsis: the local
+  dashboard address `http://127.0.0.1:8088` set as the hero figure, the five platform names
+  as an index, and one row per OS carrying its own command, its own fact and its Copy.
+  One signal colour, square surfaces, hairlines; the phone layout wraps the commands at 12px
+  instead of clipping them and drops the Copy button, because a phone copies by long-press.
+  [`cloudflare-worker-telegra-my.js`](cloudflare-worker-telegra-my.js:1) and
+  [`wrangler-telegra-my.toml`](wrangler-telegra-my.toml:1) are tracked from now on (the
+  landing page and its installers are the site); the relay worker stays ignored.
 - **The dashboard's Addon section is `#addon`** (was `#connect`), and the header nav item
   says "Addon". `#connect` and the PHP-era `#settings` still resolve through the legacy
   map, so links already out there keep working.
@@ -38,6 +131,68 @@ docker compose up -d` in a code block for a container, "install the newest APK" 
   `title` field (stremio-core drops such rows).
 
 ### Fixed
+
+- **A provision killed mid-flight no longer locks the install out, and an orphan session no longer
+  locks it out for good.** Both were found on a CPH2581 in the field. The provision lock is a file,
+  so a holder that is killed (Android restarts the service, the watchdog fires, the app is swiped
+  away) can never remove it, and nothing separates "someone is provisioning now" from "someone was
+  provisioning when the process died": measured, the engine restarted at 06:54:03 with a provision
+  in flight, the lock survived, and eight play attempts over seven minutes each waited 30 s and then
+  answered `503 NO_SESSION` until the 300 s age fallback fired. The lock now records its owner pid
+  and is reclaimed on the FIRST look when that process is gone, the request path waits 3 s instead
+  of 30 s, and a waiter no longer refreshes the holder's heartbeat (which is what kept a dead lock
+  looking alive). Second, `auto_provision_guest()` used to refuse service outright when a session
+  file existed with no `bot_id`: `A previous login did not finish. Please restart the PencariMovie
+Server.` A restart could never honour that, because nothing on the boot path removes
+  `storage/sessions/<bot_id>/`, so an install that hit it answered 500 to every provision for as
+  long as the directory existed (measured: `sessions/8582733572` outlived an engine restart). It
+  now ADOPTS an orphan session (a working bot, and no origin provision spent) and only discards one
+  that will not boot, after which a fresh lease follows in the same call. Third, `/api/download`
+  validated its payload AFTER `auto_provision_guest`, so a request with no file id and no short
+  code could spend a provision or answer `503 Connecting guest bot in progress` instead of the 400
+  it needs; the shape check now runs first. Pinned by
+  `session::tests::a_lock_from_a_dead_process_is_reclaimed_at_once` and
+  `…_from_a_live_process_counts_as_in_progress`.
+
+- **A renewal that cannot reach the origin now retries in seconds instead of a minute, and says
+  which failure it is.** The follow-up on issue #14: after the install-wide token expired while
+  the origin was unreachable, the engine kept answering `wp 401 without a token` with the reason
+  `token already expired`, and nothing in that line admitted the real state, which is that
+  renewal was simply not allowed to try again yet. `ensure_enrolled_throttled()` now acts on what
+  [`ensure_enrolled()`](src/credentials.rs:517) achieved: `EnrolOutcome::Rejected` (the origin
+  answered and refused, or the token could not be stored) keeps the steady one-minute delay, and
+  `EnrolOutcome::Transport` (status 0 or 5xx) backs off 5 s, 10, 20, 40, then holds at 60.
+  Measured on a live process with a 45 s outage ([`tools/repro_issue14_lease.mjs`](tools/repro_issue14_lease.mjs:1)):
+  recovery after connectivity returned went from **55.2 s and 32 unauthenticated resolve calls to
+  10.9 s and 4**, with no restart and no manual token removal. The 401 line appends
+  `; renewal attempt Ns ago could not reach the origin, next attempt in Ms`, and the boot
+  `pm-auth enrolment` line reports `outcome` beside `enrolled`, so "the origin was unreachable"
+  cannot be mistaken for "the origin refused this install". Pinned by
+  `credentials::provision_tests::transport_failures_back_off_then_hold_at_the_steady_minute`.
+
+- **The one-click Stremio install now says where it works, and hides where it cannot.**
+  The card asks for a Stremio password only because Stremio Web refuses a plain http addon
+  address, so it does anything useful only while the dashboard is opened on localhost or a
+  LAN IP. It was headed "Install without copying", which read as a general offer, and the
+  card body repeated the whole explanation a second time. The heading is now "Install in
+  Stremio from this page", the note under it opens with "Local and LAN only", the card body
+  carries only the credential claim, and the whole card is hidden on an https origin (a
+  tunnel, or a served domain), where the manifest is already something Stremio can add
+  directly. Verified on both: `localhost:8088` shows the card, a live
+  `*.trycloudflare.com` origin hides it.
+
+- **A seek starts about 230 ms sooner.** The preflight prime is fetched from the enclosing
+  1 MB boundary and, past byte 0, rounds up to a full 1 MB head. `fetch_range_core()` holds
+  ONE connection permit for the whole call, so that head was two 512 KB `upload.getFile`
+  parts fetched back to back, and the response body did not start until both had arrived.
+  The two parts now go out together. Measured on a 406 MB 4K source, 4 MB range windows,
+  one bot, median of 8 rounds: first byte **954 ms before, 723 ms after** (24% sooner).
+  Sustained throughput is unchanged, because only the 1 MB head is split and the pipeline
+  behind it is untouched. A byte-0 prefix keeps its single 512 KB part and sees no change.
+  The part budget (`workers x inflight`) is shared, so it is worth stating: the split holds
+  2 permits at once instead of 1, for half as long, which keeps part-seconds level.
+  Pinned by `download::tests::prime_split_covers_the_head_in_legal_parts` and
+  `download::tests::only_one_part_heads_skip_the_split`.
 
 - **Saving catalog settings can no longer blank the configuration.**
   `write_catalog_settings()` truncated `storage/catalog_settings.json` with `fs::write` before

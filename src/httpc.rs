@@ -50,6 +50,52 @@ pub fn is_connection_reset(message: &str) -> bool {
         || s.contains("etimedout")
         || s.contains("econnrefused")
         || s.contains("connection reset")
+        // Added after the reqwest cause chain started being logged: a pooled
+        // connection the peer already closed, a TLS handshake the middlebox ate,
+        // and a body cut mid-stream all arrive as these.
+        || s.contains("connection closed")
+        || s.contains("connection aborted")
+        || s.contains("incomplete message")
+        || s.contains("body error")
+        || s.contains("tcp connect error")
+        || s.contains("dns error")
+        || s.contains("error decoding response body")
+        || s.contains("unexpected eof")
+        || s.contains("broken pipe")
+        // reqwest words a client timeout as `operation timed out`, so the PHP-era
+        // `etimedout` needle above never matched it. Measured: every `hary*` search
+        // went straight to a `status:0` failure with this text while the identical
+        // query answered on a second attempt.
+        || s.contains("timed out")
+        || s.contains("timeout")
+}
+
+/// reqwest's `Display` for a send failure is ONLY
+/// `error sending request for url (…)`; the reason — "connection reset by peer",
+/// "tcp connect error", "dns error" — lives in the `source()` chain.
+///
+/// Logging the bare message made [`is_connection_reset()`] unable to classify ANY
+/// transport failure, so the `telegra.my` DPI fallback never fired and a burst of
+/// dashboard traffic just filled the log with `status:0` (measured: 34 lines in
+/// two minutes, against pencarimovie.com AND aiometadata.elfhosted.com, while the
+/// same URLs answered 200 to another client on the same machine).
+fn err_text(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    let mut depth = 0;
+    while let Some(s) = src {
+        let t = s.to_string();
+        if !t.is_empty() && !out.contains(&t) {
+            out.push_str(": ");
+            out.push_str(&t);
+        }
+        src = s.source();
+        depth += 1;
+        if depth > 6 {
+            break;
+        }
+    }
+    out
 }
 
 async fn raw_get(url: &str, timeout_secs: u64, extra: &HashMap<String, String>) -> (bool, u16, String, Option<String>) {
@@ -64,10 +110,10 @@ async fn raw_get(url: &str, timeout_secs: u64, extra: &HashMap<String, String>) 
             let ok = r.status().is_success();
             match r.text().await {
                 Ok(t) => (ok, status, t, None),
-                Err(e) => (false, status, String::new(), Some(e.to_string())),
+                Err(e) => (false, status, String::new(), Some(err_text(&e))),
             }
         }
-        Err(e) => (false, 0, String::new(), Some(e.to_string())),
+        Err(e) => (false, 0, String::new(), Some(err_text(&e))),
     }
 }
 
@@ -77,6 +123,21 @@ pub async fn get_contents(url: &str, timeout_secs: u64, extra: HashMap<String, S
     let (ok, status, text, err) = raw_get(url, timeout_secs, &extra).await;
     if ok {
         return Some(text);
+    }
+    let mut err = err;
+    // ONE same-host retry before the DPI fallback. A pooled connection the peer
+    // has already closed fails exactly once and then works, which is the pattern
+    // that emptied whole catalogs (`catalog built {"count":0}`) on a healthy host.
+    if err.as_deref().map(is_connection_reset).unwrap_or(false) {
+        log(
+            "outbound request reset, retrying once",
+            &serde_json::json!({"url": url}),
+        );
+        let (ok2, _s2, text2, err2) = raw_get(url, timeout_secs, &extra).await;
+        if ok2 {
+            return Some(text2);
+        }
+        err = err2;
     }
     if let Some(e) = &err {
         if is_connection_reset(e) {
@@ -133,6 +194,41 @@ pub(crate) fn pm_auth_headers(method: &str, url: &str) -> Vec<(String, String)> 
     ]
 }
 
+/// True only for the ORIGIN's REST API — never for a third-party host.
+///
+/// MEASURED 2026-11-07 from `heroku logs -n 1500` on the live app, and it was
+/// self-inflicted: the backfill SOURCE hosts answer 401 by design (the removed
+/// fallback did it on every path with `bitchord_auth`), and the 401 branch below
+/// did not look at the host. So each source attempt ran `clear_auth_token()`:
+///
+/// ```text
+/// wp 401 with a token, re-enrolling {"url":"…/a/stream/28210785"}
+/// pm-auth enrol skipped {"reason":"another attempt is in flight"}
+/// ```
+///
+/// — the engine logged ITSELF out of the origin every time the source answered
+/// 401, `ensure_enrolled_throttled()` then refused to recover faster than once a
+/// minute, and dynos left holding no token answered `/resolve-file` and
+/// `/search-music` with 401 (`web.3` did exactly that for minutes:
+/// `unreadable /data/storage/auth_token.json`). The 401-by-design host is gone,
+/// but the remaining source is third-party too, so the host check stays.
+///
+/// The same predicate stops the WORSE half, which the logs cannot show: the
+/// install's `X-PM-Auth` token, signing pubkey and proof were being chained onto
+/// every outgoing request, including the third-party source hosts. An install
+/// credential has no business leaving for a host that is not the origin.
+fn is_origin_api(url: &str) -> bool {
+    let host_of = |u: &str| {
+        url::Url::parse(u)
+            .ok()
+            .and_then(|p| p.host_str().map(|h| h.to_ascii_lowercase()))
+    };
+    match (host_of(url), host_of(&crate::config::wp_api_base())) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// `fd_http_json()`: GET (query string) or POST (JSON body) with X-API-Secret.
 pub async fn http_json(url: &str, params: &[(String, String)], method: &str, timeout_secs: u64) -> Value {
     http_json_h(url, params, method, timeout_secs, &[]).await
@@ -176,18 +272,21 @@ pub async fn http_json_h_status(
     // expires after 60 minutes anyway. Measured on a CPH2581: /api/resolve-shortcode
     // answered `{"ok":0}` forever because the resolve call carried no credential at
     // all. This makes every origin call enrol first when it has nothing to send.
-    if crate::credentials::auth_token().is_empty() {
+    let mut target = url.to_string();
+    // Origin call? Only then is a credential even meaningful. Sending it to a
+    // third-party host leaks an install token for nothing, and asking to enrol
+    // because a SOURCE answered 401 is what took the dynos offline on Heroku.
+    let origin_call = is_origin_api(&target);
+    if origin_call && crate::credentials::auth_token().is_empty() {
         crate::credentials::ensure_enrolled_throttled().await;
     }
 
-    let mut target = url.to_string();
     let secret = get_api_secret();
-    let mut extra: Vec<(String, String)> = headers
-        .iter()
-        .cloned()
-        .chain(crate::credentials::ticket_headers())
-        .chain(pm_auth_headers(method, &target))
-        .collect();
+    let mut extra: Vec<(String, String)> = headers.iter().cloned().collect();
+    if origin_call {
+        extra.extend(crate::credentials::ticket_headers());
+        extra.extend(pm_auth_headers(method, &target));
+    }
 
     let mut body: Option<String> = None;
     if method.eq_ignore_ascii_case("GET") {
@@ -236,10 +335,10 @@ pub async fn http_json_h_status(
                     let ok = r.status().is_success();
                     match r.text().await {
                         Ok(t) => (ok, status, t, None::<String>),
-                        Err(e) => (false, status, String::new(), Some(e.to_string())),
+                        Err(e) => (false, status, String::new(), Some(err_text(&e))),
                     }
                 }
-                Err(e) => (false, 0, String::new(), Some(e.to_string())),
+                Err(e) => (false, 0, String::new(), Some(err_text(&e))),
             }
         }
     };
@@ -275,7 +374,7 @@ pub async fn http_json_h_status(
     // cannot drift meaningfully in 10 minutes, so this is free.
     static LAST_CLOCK_PROBE: std::sync::atomic::AtomicI64 =
         std::sync::atomic::AtomicI64::new(0);
-    if status == 401 {
+    if status == 401 && origin_call {
         // Re-learn the clock BEFORE re-signing, in BOTH cases.
         //
         // A skewed clock is the one fault that makes an install look tokenless: a
@@ -340,6 +439,17 @@ pub async fn http_json_h_status(
             }
         }
     }
+    // THE arming point for the origin-down gate.
+    //
+    // Every origin call outside the catalog path lands here — `resolve-file`,
+    // `resolve-files`, the auth routes — and none of them went through
+    // `cached_wp_json()`, which was the only place that called `wp_note_status()`.
+    // So `status == 0` from a resolve recorded nothing, and the next thing to ask
+    // "is the origin reachable?" got "yes" and burned another full timeout. Measured
+    // on a phone (2026-11-02): `http_json failed … operation timed out`, then
+    // `resolve returned no file id … status:0`, then `/api/download` answered
+    // `400 MISSING_FILE_ID` — a client error for the origin's outage.
+    wp_note_status(status);
     if !ok {
         log(
             "http_json failed",
@@ -384,9 +494,29 @@ const WP_STALE_BUDGET_S: u64 = 3;
 ///
 /// A transport timeout is not a property of ONE url: it is the origin being gone.
 /// So the first `status == 0` arms this gate and every later call fails fast
-/// instead of re-discovering the same outage. 20 s is short enough that a blip
-/// recovers on its own and long enough to cover one browse.
-const WP_DOWN_SECS: i64 = 20;
+/// instead of re-discovering the same outage.
+///
+/// 45 s, and the reason is exact: a resolve ladder is bounded by
+/// `resolve::RESOLVE_BUDGET` = **20 s**, and it is that ladder's LAST failed attempt
+/// which arms this. The old 20 s therefore expired at the same instant the ladder
+/// gave up, so the caller asking "was that an outage?" one line later always read
+/// `0` — measured on 2026-11-02 against an unresolvable origin: `/api/download`
+/// answered `400 MISSING_FILE_ID` for a request whose every hop had failed to
+/// connect. The window must outlive the ladder that arms it; it is still short
+/// enough that a blip recovers on its own.
+const WP_DOWN_SECS: i64 = 45;
+
+/// The refusal code for "the origin never answered".
+///
+/// One name, because the same outage reaches the user through three different
+/// routes (`/api/download`, the guest provision, `/stream`), and three spellings of
+/// one fault is what made it unfindable in the incident log.
+pub const ORIGIN_UNREACHABLE: &str = "ORIGIN_UNREACHABLE";
+
+/// One sentence for it too — host-free on purpose, because `wp_api_base()` is
+/// env-overridable and a hard-coded domain would be a lie on a self-hosted origin.
+pub const ORIGIN_UNREACHABLE_MSG: &str =
+    "The catalog origin is unreachable. Retry in a few seconds.";
 
 /// Until this instant the origin counts as down (`0` = healthy).
 static WP_DOWN_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -569,5 +699,81 @@ mod tests {
         assert!(!needs_wp_retry(&serde_json::json!({"ok": 1, "items": []})));
         assert!(!needs_wp_retry(&serde_json::json!({"ok": 1, "total": 0})));
         assert!(!needs_wp_retry(&serde_json::Value::Null));
+    }
+
+    /// The bug this closes: reqwest's `Display` alone is
+    /// `error sending request for url (…)`, which matched NOTHING here, so the
+    /// retry and the DPI fallback were dead code for every transport failure.
+    /// The cause only arrives once `err_text()` walks the `source()` chain.
+    #[test]
+    fn a_reqwest_send_error_is_classified_only_with_its_cause_chain() {
+        let bare = "error sending request for url (https://pencarimovie.com/wp-json/x)";
+        assert!(!is_connection_reset(bare), "the bare Display carries no cause");
+
+        for msg in [
+            "error sending request for url (…): connection reset by peer (os error 10054)",
+            "error sending request for url (…): tcp connect error: Connection refused (os error 111)",
+            "error sending request for url (…): dns error: failed to lookup address information",
+            "error decoding response body: connection closed before message completed",
+            "error sending request for url (…): TLS handshake failed: unexpected eof",
+            // reqwest's own wording; the PHP-era `etimedout` needle never matched it.
+            "error sending request for url (…): operation timed out",
+        ] {
+            assert!(is_connection_reset(msg), "should be retried: {msg}");
+        }
+        // An HTTP answer is never a transport failure, whatever the status.
+        assert!(!is_connection_reset("503 Service Unavailable"));
+    }
+
+    /// Only a request that never completed is an outage. A 404/401/500 is the
+    /// origin talking, and telling the user "unreachable" for those would hide a
+    /// real answer — `note_wp_origin_answered()` clears the gate on any of them.
+    #[test]
+    fn only_a_status_of_zero_arms_the_origin_gate() {
+        wp_note_status(200);
+        assert_eq!(wp_origin_down_secs(), 0, "healthy origin: gate closed");
+        wp_note_status(404);
+        assert_eq!(wp_origin_down_secs(), 0, "a 404 proves the origin is alive");
+        wp_note_status(0);
+        assert!(wp_origin_down_secs() > 0, "a transport failure arms the gate");
+        wp_note_status(200);
+        assert_eq!(wp_origin_down_secs(), 0, "first answer after an outage reopens it");
+    }
+
+    /// The regression that made the whole classification useless: the window was
+    /// 20 s and `resolve::RESOLVE_BUDGET` is 20 s, so the gate armed by the ladder's
+    /// last failed attempt expired at the instant the ladder gave up — every later
+    /// `wp_origin_down_secs()` read 0 and `/api/download` answered 400.
+    #[test]
+    fn the_origin_down_window_outlives_a_resolve_ladder() {
+        assert!(
+            WP_DOWN_SECS > 20,
+            "must outlive resolve::RESOLVE_BUDGET (20 s), or the caller reads 0"
+        );
+    }
+
+    /// The Heroku regression (2026-11-07): a 401 from the hi-res fallback host
+    /// cleared the origin token and started an enrolment the throttle then refused,
+    /// so dynos ran with no credential and 401'd every origin call.
+    #[test]
+    fn only_the_origin_host_may_touch_the_install_credential() {
+        let base = crate::config::wp_api_base();
+        assert!(
+            is_origin_api(&format!("{}/resolve-file?short_code=x", base)),
+            "the origin's own API must be recognised"
+        );
+        assert!(
+            is_origin_api(&format!("{}/search-music?search=x", base.trim_end_matches('/'))),
+            "a query string must not change the verdict"
+        );
+        assert!(
+            !is_origin_api("https://heisenbergbackaaahh.de.deplexo.com/a/search?q=x"),
+            "a third-party source host is never the origin"
+        );
+        assert!(
+            !is_origin_api("https://streaming-qobuz-std.akamaized.net/file?eid=1"),
+            "nor is the CDN the signed master comes from"
+        );
+        assert!(!is_origin_api("not a url"), "garbage is not the origin");
     }
 }

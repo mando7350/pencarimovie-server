@@ -62,7 +62,15 @@ const EDITION_TAGS: &str = "(?i)\\b(?:extended(?:\\s*cut)?|directors?\\s*cut|unr
 const SEQUEL_RE: &str = "(?i)\\b(?:part\\s*(?:ii|iii|iv|v|\\d+)|(?:2|3|4|5|6|7|8|9)|chapter\\s*\\d+)\\b";
 const UPLOADER_RE: &str = "(?i)^(?:(?:sklink|office|movie|movies|king|film|films|cinema|cinemas|media|channel|tv|tele|tg|hub|world|zone|group|team|club|gang|bot|vip|official|download|downloads|upload|uploads|site|store|station|blasters|rockers|wap|villa|dub|yogi|verse|flix|pahe|galaxy|pms|mkv|link|links|hd)\\b\\s*)+$";
 const TARGET_TAGS: &str = "(?i)\\b(?:2160p|1080p|720p|480p|360p|uhd|fhd|hd|sd|hdtv|web-?dl|webrip|bluray|blu-ray|remux|dvdrip|hevc|x264|x265|h264|h265|\\d+(?:\\.\\d+)?\\s*(?:gb|mb))\\b";
-const LEADING_GROUPS: &str = "(?i)^(?:prakytv|ngefilm\\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\\s*time\\s*studio\\s*ghibli\\s*movie\\s*\\d*|mcu|pms|pahe\\.li|layarkaca\\d*|cinemaindo|indoxxi|sklink(?:\\s*office)?|movie\\s*king|movie\\s*world|film\\s*world|tamilblasters|1tamilmv|tamilmv|tamilrockers|tamilyogi|tamilgun|isaidub|kuttymovies|moviesda|bolly4u|desiremovies|worldfree4u|katmoviehd|skymovieshd|filmywap|filmyzilla|extramovies|9xmovies|movieswood|jiorockers|todaypk|cinevood|hdhub4u|dotmovies|topmovies|modmobile|uhdmovies|allmovieshub|moviesverse|luxmovie|cinemalover|flixhub|movies4u|plexmovies|moviesrocker|mkvking|psa|yts)\\s+";
+// The separator class after a known group is `.`, `_`, `-` OR whitespace, not just
+// whitespace. Telegram uploads separate words with DOTS (`PrakyTV.Avaraachan.&.Sons.
+// 2026.Tamil…`), so with `\s+` the `prakytv` entry never fired, the uploader prefix
+// stayed part of the title, and every such file was rejected — measured on
+// `pm:post:9296788885` "Avaraachan & Sons 2026", whose six origin files all failed
+// while `pm_search_files` listed seven. Stripping is followed by the strict title
+// comparison, so widening the separator can only remove a PREFIX, never turn a
+// different film into a match.
+const LEADING_GROUPS: &str = "(?i)^(?:prakytv|ngefilm\\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\\s*time\\s*studio\\s*ghibli\\s*movie\\s*\\d*|mcu|pms|pahe\\.li|layarkaca\\d*|cinemaindo|indoxxi|sklink(?:\\s*office)?|movie\\s*king|movie\\s*world|film\\s*world|tamilblasters|1tamilmv|tamilmv|tamilrockers|tamilyogi|tamilgun|isaidub|kuttymovies|moviesda|bolly4u|desiremovies|worldfree4u|katmoviehd|skymovieshd|filmywap|filmyzilla|extramovies|9xmovies|movieswood|jiorockers|todaypk|cinevood|hdhub4u|dotmovies|topmovies|modmobile|uhdmovies|allmovieshub|moviesverse|luxmovie|cinemalover|flixhub|movies4u|plexmovies|moviesrocker|mkvking|psa|yts)[._\\s-]+";
 const COUNTRY_PREFIX: &str = "(?i)^(?:ph|id|ina|my|kr|kor|jp|jpn|th|thai|cn|chi|us|uk|hk|vn|tw|ru|tr|es|fr|de|it|in)\\s+";
 /// `^(?:video(\.\d+)*|\d+|document|file)\.(?:mp4|mkv|avi|mov|ts|flv)$` — a file
 /// whose NAME carries nothing, so the caption's first line is the real title.
@@ -226,6 +234,43 @@ pub fn strip_title_decorations(title: &str) -> String {
         "",
     );
     squash(&t)
+}
+
+/// The season a title names, or `0` when it names none.
+///
+/// An addon item can BE one season of a show: AIOMetadata publishes Black Clover
+/// season 2 as a separate entry titled "Black Clover Season 2 2026" whose videos
+/// are numbered 1..13. Those episodes are `S02E01..S02E13` in the origin's files,
+/// so treating the item's episode 2 as "S01E02" listed the FIRST season under a
+/// season-2 episode (reported: "it show season 1").
+pub fn season_from_title(title: &str) -> i32 {
+    let t = decode_html_entities(title);
+    if let Some(g) = groups("(?i)\\bseason\\s*0*(\\d{1,2})\\b", &t) {
+        if let Ok(n) = g[1].parse::<i32>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    if let Some(g) = groups("(?i)\\b0*(\\d{1,2})(?:st|nd|rd|th)\\s+season\\b", &t) {
+        if let Ok(n) = g[1].parse::<i32>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    for (word, n) in [
+        ("second", 2i32),
+        ("third", 3),
+        ("fourth", 4),
+        ("fifth", 5),
+        ("sixth", 6),
+    ] {
+        if has(&format!("(?i)\\b{}\\s+season\\b", word), &t) {
+            return n;
+        }
+    }
+    0
 }
 
 /// `normTitleForMatch`: decorations stripped, lowercased, punctuation collapsed.
@@ -866,7 +911,29 @@ pub fn is_release_annotation(subtitle: &str) -> bool {
 /// mismatch (another show's episode title). A ONE-WORD tail is never evidence —
 /// it is the uploader/group between the marker and the quality tag.
 pub fn episode_subtitle_matches(file_title: &str, series_title: &str, episode_names: &[String]) -> bool {
-    if episode_names.is_empty() {
+    episode_subtitle_matches_with_siblings(file_title, series_title, episode_names, &[])
+}
+
+/// [`episode_subtitle_matches()`] plus the OTHER episodes' titles.
+///
+/// The rule is deliberately asymmetric, and this is what makes it safe:
+///
+///   * the post-marker text matches THIS episode's title -> accept;
+///   * it matches a DIFFERENT episode of the same season -> REJECT (that is the
+///     pinned "a file that names another show's episode" case);
+///   * it matches nothing at all -> **fail open**. A file named in the
+///     uploader's own ordering is still this episode: Disney's "Oswald" is
+///     numbered 1..52 by theTVDB while the uploader ships two segments per file,
+///     so `S01E02 Sleepover & Big Banana` is E2 even though theTVDB calls E2
+///     "The Camping Trip". Rejecting on "not the title I expected" dropped all
+///     50 Oswald files and answered "No Streams Found" for every episode.
+pub fn episode_subtitle_matches_with_siblings(
+    file_title: &str,
+    series_title: &str,
+    episode_names: &[String],
+    sibling_names: &[String],
+) -> bool {
+    if episode_names.is_empty() && sibling_names.is_empty() {
         return true;
     }
     let subtitle = filename_episode_subtitle(file_title, series_title);
@@ -876,13 +943,34 @@ pub fn episode_subtitle_matches(file_title: &str, series_title: &str, episode_na
     if !subtitle.contains(' ') {
         return true;
     }
-    for raw in episode_names {
-        let expected = normalize_episode_name(raw);
-        if !expected.is_empty() && (subtitle == expected || subtitle.starts_with(&format!("{} ", expected))) {
-            return true;
-        }
+    // THIS episode's title, possibly followed by more text: an own match is
+    // enough to keep the file.
+    let hits_own = |list: &[String]| {
+        list.iter().any(|raw| {
+            let expected = normalize_episode_name(raw);
+            !expected.is_empty()
+                && (subtitle == expected || subtitle.starts_with(&format!("{} ", expected)))
+        })
+    };
+    // A sibling's title must match the WHOLE subtitle. A prefix is not enough:
+    // theTVDB files Oswald's "Sleepover" as E13 and "Big Banana" as E14 while the
+    // uploader's E2 is the pair, so `S01E02 Sleepover & Big Banana` merely
+    // STARTS WITH a sibling title and is still the right file for its episode.
+    let hits_sibling = |list: &[String]| {
+        list.iter().any(|raw| {
+            let expected = normalize_episode_name(raw);
+            !expected.is_empty() && subtitle == expected
+        })
+    };
+    if hits_own(episode_names) {
+        return true;
     }
-    false
+    if hits_sibling(sibling_names) {
+        // A KNOWN other episode's title, in full: this file is that episode.
+        return false;
+    }
+    // Nothing we know: no evidence, so it cannot hide a stream.
+    true
 }
 
 /* ── fd_series_file_matches_title ──────────────────────────────────────────── */
@@ -899,6 +987,25 @@ pub fn series_file_matches_title(
     series_year: &str,
     file_caption: &str,
     episode_names: &[String],
+) -> bool {
+    series_file_matches_title_with_siblings(
+        file_title, series_title, season, episode, series_year, file_caption, episode_names, &[],
+    )
+}
+
+/// [`series_file_matches_title()`] plus the sibling episode titles — see
+/// [`episode_subtitle_matches_with_siblings()`] for why the extra evidence makes
+/// the guard stricter instead of looser.
+#[allow(clippy::too_many_arguments)]
+pub fn series_file_matches_title_with_siblings(
+    file_title: &str,
+    series_title: &str,
+    season: i32,
+    episode: i32,
+    series_year: &str,
+    file_caption: &str,
+    episode_names: &[String],
+    sibling_names: &[String],
 ) -> bool {
     let parsed = classify_season_episode(file_title, season, episode, file_caption);
     if !file_matches_episode(parsed, season, episode) {
@@ -1058,7 +1165,7 @@ pub fn series_file_matches_title(
     }
 
     // 5d. Generic episode-name guard. Fail open when the metadata is unknown.
-    if !episode_subtitle_matches(file_title, &target_lower, episode_names) {
+    if !episode_subtitle_matches_with_siblings(file_title, &target_lower, episode_names, sibling_names) {
         return false;
     }
 
@@ -2175,6 +2282,105 @@ mod tests {
         ));
     }
 
+    /* reported: a title with an ampersand ------------------------------- */
+
+    /// `pm:post:9296788885` "Avaraachan & Sons 2026 • Movie": the origin
+    /// returned SIX files for this post and the matcher rejected all of them, so
+    /// the title answered "No Streams Found" while everything it needed was
+    /// present. The `&` is the suspect: the TARGET is rewritten to " and ", the
+    /// FILE side keeps a bare `&` (dropped as punctuation by `clean_media_title`)
+    /// or spells it "and", and the two forms have to meet.
+    /// Reported: "Oswald" answered "No Streams Found" for every episode although
+    /// the origin held 50 files. theTVDB numbers the show 1..52 and names E2
+    /// "The Camping Trip"; the uploader ships two segments per file and calls it
+    /// "S01E02 Sleepover & Big Banana". The guard read "not my title" as "another
+    /// episode" and dropped the whole list.
+    #[test]
+    fn an_episode_title_in_another_ordering_is_not_a_mismatch() {
+        let own = vec!["the camping trip".to_string()];
+        let siblings = vec![
+            "the polka dot umbrella".to_string(),
+            "chasing the ice cream truck".to_string(),
+        ];
+        // Named differently from what the metadata calls it -> KEEP (fail open).
+        assert!(episode_subtitle_matches_with_siblings(
+            "Oswald.S01E02.Sleepover.&.Big.Banana.480p.AMZN.WEB.DL.mkv",
+            "oswald",
+            &own,
+            &siblings
+        ));
+        // Named as a DIFFERENT known episode -> reject (the pinned protection).
+        assert!(!episode_subtitle_matches_with_siblings(
+            "Oswald.S01E02.The.Polka.Dot.Umbrella.480p.WEB.mkv",
+            "oswald",
+            &own,
+            &siblings
+        ));
+        // Its own title -> keep.
+        assert!(episode_subtitle_matches_with_siblings(
+            "Oswald.S01E02.The.Camping.Trip.480p.WEB.mkv",
+            "oswald",
+            &own,
+            &siblings
+        ));
+        // No metadata at all -> keep (the guard can never hide a stream on its own).
+        assert!(episode_subtitle_matches_with_siblings(
+            "Oswald.S01E02.Sleepover.&.Big.Banana.mkv",
+            "oswald",
+            &[],
+            &[]
+        ));
+        // A whole title still has to be matched as a whole: a one-word subtitle is
+        // the uploader tag, not evidence.
+        assert!(episode_subtitle_matches_with_siblings(
+            "Oswald.S01E02.PrakyTV.1080p.WEB.mkv",
+            "oswald",
+            &own,
+            &siblings
+        ));
+    }
+
+    /// Reported: opening Black Clover **season 2** listed season 1's files.
+    /// The addon item is "Black Clover Season 2 2026" (`kitsu:50024`) whose
+    /// episodes are numbered from 1, while the origin files them `S02E01..13`.
+    #[test]
+    fn season_from_title_reads_the_markers_addons_use() {
+        assert_eq!(season_from_title("Black Clover Season 2 2026"), 2);
+        assert_eq!(season_from_title("Black Clover Second Season 2026"), 2);
+        assert_eq!(season_from_title("Foo 3rd Season"), 3);
+        assert_eq!(season_from_title("Foo Season 02"), 2);
+        // No marker: the caller keeps whatever the id said.
+        assert_eq!(season_from_title("Black Clover 2017"), 0);
+        assert_eq!(season_from_title("The 100"), 0);
+        assert_eq!(season_from_title("Oswald"), 0);
+    }
+
+    #[test]
+    fn movie_matches_a_title_with_an_ampersand() {
+        let title = "Avaraachan & Sons 2026 • Movie";
+        for f in [
+            "PrakyTV.Avaraachan.&.Sons.2026.Tamil.TRUE.WEB.DL.mkv",
+            "PrakyTV.Avaraachan.&.Sons.2026.Tamil.HQ.HDRip.720.mkv",
+            "Avaraachan.and.Sons.2026.Submalay.mp4",
+        ] {
+            assert!(
+                movie_file_matches_title(f, title, "2026", "", ""),
+                "the ampersand title must match {f}"
+            );
+        }
+        // The control: the same title with the entity decoded must behave the
+        // same way, or the `&` is not what the rule is testing.
+        for f in ["PrakyTV.Avaraachan.&.Sons.2026.Tamil.TRUE.WEB.DL.mkv"] {
+            assert!(movie_file_matches_title(
+                f,
+                "Avaraachan & Sons 2026 • Movie",
+                "2026",
+                "",
+                ""
+            ));
+        }
+    }
+
     /* trap 5: accents -------------------------------------------------------- */
 
     #[test]
@@ -2654,11 +2860,56 @@ mod tests {
 
     #[test]
     fn episode_subtitle_rejects_another_shows_episode() {
-        // The cross-show case the guard EXISTS for: a multi-word tail that
-        // disagrees with the verified episode name.
-        assert!(!episode_subtitle_matches(
+        // REVISED 2026-11-06 — the guard is now "names a DIFFERENT KNOWN episode
+        // of this show", not "does not match the one name I was given".
+        //
+        // The old expectation rejected this file, and the file is right: it IS
+        // One Piece S01E01 ("Romance Dawn"); the single verified name belonged to
+        // another episode. That same over-strictness dropped all 50 files of
+        // Disney's "Oswald", where theTVDB numbers 1..52 two-per-file and the
+        // uploader uses its own segment titles, so every episode of the show
+        // answered "No Streams Found" while the files were all there.
+        assert!(episode_subtitle_matches(
             "One.Piece.S01E01.Romance.Dawn.1080p.mkv",
             "one piece",
+            &names(&["Uncaught Third Strike"])
+        ));
+        assert!(series_file_matches_title(
+            "One.Piece.S01E01.Romance.Dawn.1080p.mkv",
+            "One Piece",
+            1,
+            1,
+            "",
+            "",
+            &names(&["Uncaught Third Strike"])
+        ));
+
+        // The cross-show protection that actually carries the weight is the
+        // SERIES TITLE, and it still holds: this file's prefix is another show.
+        assert!(!series_file_matches_title(
+            "Im.Not.Afraid.S01E01.The.Witch.1080p.NF.WEB.DL.mkv",
+            "The Witch",
+            1,
+            1,
+            "2025",
+            "",
+            &names(&["The Witch"])
+        ));
+
+        // And the name guard still rejects a file that names a DIFFERENT KNOWN
+        // episode of the SAME show — the sibling evidence is what makes that
+        // decidable instead of guessed.
+        assert!(!episode_subtitle_matches_with_siblings(
+            "One.Piece.S01E01.Uncaught.Third.Strike.1080p.mkv",
+            "one piece",
+            &names(&["Romance Dawn"]),
+            &names(&["Uncaught Third Strike"])
+        ));
+        // A tail that matches NOTHING known is content, not evidence.
+        assert!(episode_subtitle_matches_with_siblings(
+            "One.Piece.S01E01.Some.Other.Cut.1080p.mkv",
+            "one piece",
+            &names(&["Romance Dawn"]),
             &names(&["Uncaught Third Strike"])
         ));
     }

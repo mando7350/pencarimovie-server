@@ -248,6 +248,36 @@ pub fn require_privileged(ctx: &ReqCtx) -> Option<Response> {
     }
 }
 
+/// The gate for the routes the DASHBOARD drives from a browser: same network, or
+/// a token.
+///
+/// Neither existing gate fits. [`require_auth`] answers true for every caller when
+/// no password is set (it returns true when `!auth_enabled()`), so it closes
+/// nothing on the common install. [`require_privileged`] refuses a LAN peer, which
+/// broke the dashboard opened at `http://192.168.x.x:8088`: the page loaded, the
+/// catalogs rendered, and then "Add bot" and every catalog toggle answered 403.
+///
+/// The boundary these routes actually need is "not the internet". `is_local_request`
+/// already refuses a tunnelled request first, and refuses a public
+/// `x-forwarded-for`, so a Cloudflare Tunnel, a PaaS host and any proxied caller
+/// still need the token. A machine on the same network is inside the trust boundary
+/// this whole install is built for, and it is already exempted on `/api/download`
+/// and from the per-client limits.
+pub fn require_trusted_device(ctx: &ReqCtx) -> Option<Response> {
+    if is_local_request(ctx) || auth_privileged(ctx) {
+        None
+    } else {
+        Some(json_response(
+            403,
+            &serde_json::json!({
+                "ok": 0,
+                "message": "This action must be performed on this machine or network (or with a valid token).",
+                "local_only": true
+            }),
+        ))
+    }
+}
+
 pub async fn url_host_is_public(raw: &str) -> bool {
     let parsed = match url::Url::parse(raw) {
         Ok(u) => u,
@@ -301,6 +331,38 @@ fn random_hex(bytes: usize) -> String {
     hex::encode(buf)
 }
 
+/// The "your addon URL just changed" warning, printed ONCE per process.
+///
+/// This is the user report "the streams list says the token/password changed"
+/// (2026-11-03), and it is not a bug in the card: `/<token>/manifest.json` is the
+/// addon URL, and the token is minted RANDOMLY at boot whenever `SERVER_TOKEN` is
+/// unset and `auth.json` is not on disk ([`auth_load`]). On a host whose `storage/`
+/// is not persistent — the Render instance wiped `/data/storage` on a redeploy,
+/// proven by `device_id` changing with it — every installed addon therefore starts
+/// answering the locked "Addon URL changed or password required" card, and
+/// re-installing only lasts until the next restart.
+///
+/// Measured: the token that played fine at 20:43 (`ec7bb245…`) answered the locked
+/// card at 21:04 while the new one (`a966a104…`) served 61 rows — same process
+/// otherwise, so the rotation is the whole fault.
+///
+/// The operator has to be told this, not the user, so it goes out always-on:
+/// `stderr_log`, not `log()`.
+fn log_minted_token_once() {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    crate::log::stderr_log(
+        "addon token minted for this boot",
+        Some(&serde_json::json!({
+            "why": "SERVER_TOKEN is unset and storage held no auth.json",
+            "effect": "every installed addon URL /<token>/... answers the locked card until it is re-installed, and again after the next restart if storage is not persistent",
+            "fix": "set SERVER_TOKEN to a stable string so the token survives restarts",
+        })),
+    );
+}
+
 pub fn auth_load() -> AuthData {
     if let Ok(guard) = cache().lock() {
         if let Some(d) = guard.as_ref() {
@@ -319,6 +381,7 @@ pub fn auth_load() -> AuthData {
         // NEVER hash on the load path (backend.php:1515).
         data.password_hash = Some(String::new());
     }
+    let mut minted = false;
     match env("SERVER_TOKEN") {
         Some(t) => {
             data.token = Some(t.split(',').next().unwrap_or("").trim().to_string());
@@ -326,8 +389,12 @@ pub fn auth_load() -> AuthData {
         None => {
             if data.token.as_deref().unwrap_or("").is_empty() {
                 data.token = Some(random_hex(16));
+                minted = true;
             }
         }
+    }
+    if minted {
+        log_minted_token_once();
     }
     if data.enabled.is_none() {
         data.enabled = Some(true);
@@ -376,7 +443,33 @@ pub fn auth_rotate_token() -> String {
     let mut data = auth_load();
     data.token = Some(random_hex(16));
     auth_save(&data);
+    log_token_rotated("explicit rotate");
     data.token.unwrap_or_default()
+}
+
+/// Announced on every rotation, always-on (`stderr_log`, not `log()`).
+///
+/// The token IS the addon URL (`/<token>/manifest.json`), so rotating it
+/// invalidates every installed addon **without a restart** — which is the user
+/// report "the streams list shows the token/password changed" (2026-11-03) from
+/// someone who had not redeployed. The triggers are all deliberate:
+/// [`auth_set_password`] (reached by `/api/auth/password`, `/api/auth/reset`),
+/// [`auth_rotate_token`] (`/api/auth/token/rotate`), and a boot that mints a
+/// fresh token when `SERVER_TOKEN` is unset and storage was wiped
+/// (see [`log_minted_token_once`]).
+///
+/// Rotation on a password change is correct; being silent about it is not. One
+/// line here is the difference between "the addon broke" and "somebody changed
+/// the password".
+fn log_token_rotated(cause: &str) {
+    crate::log::stderr_log(
+        "addon token rotated",
+        Some(&serde_json::json!({
+            "cause": cause,
+            "effect": "every installed addon URL /<old-token>/... now answers the locked card until it is re-installed from #addon",
+            "note": "the new token is in this response body and in the dashboard addon section; set SERVER_TOKEN to stop boot-time rotation",
+        })),
+    );
 }
 
 /// The `Set-Cookie` value for a freshly minted token.
@@ -466,7 +559,12 @@ pub fn auth_set_password(password: &str) {
     let mut data = auth_load();
     let salt = random_hex(16);
     data.password_hash = Some(format!("sha256${}${}", salt, hash_password(password, &salt)));
-    data.token = Some(random_hex(16));
+    // Decoupled: changing the password preserves the existing addon token so
+    // installed addon URLs on TVs/Stremio do not break on a routine admin
+    // password change. Only /api/auth/token/rotate rotates the token.
+    if data.token.as_deref().unwrap_or("").is_empty() {
+        data.token = Some(random_hex(16));
+    }
     data.enabled = Some(true);
     auth_save(&data);
 }
@@ -679,14 +777,31 @@ pub fn require_auth(ctx: &ReqCtx) -> Option<Response> {
     }
 }
 
+/// Strip the token segment(s) so the router sees a real route.
+///
+/// The loop is not paranoia: a page that rebuilds its links from an ALREADY
+/// tokenised href produced `/<token>/<token>/api/download` (the WordPress
+/// `markServerActive()` rewrite, fixed 2026-11-05). Stripping one copy left
+/// `/<token>/api/download`, which is not a route, so the answer was the SPA
+/// (200 `text/html`) instead of the file — a download that "doesn't work" with
+/// no error anywhere. Two copies are tolerated forever; a third answer would
+/// have no meaning, so the loop is bounded.
 pub fn strip_token_prefix(path: &str) -> String {
-    if let Some((_, tail)) = find_token_prefix(path) {
-        return tail;
+    let mut out = path.to_string();
+    for _ in 0..4 {
+        let next = match find_token_prefix(&out) {
+            Some((_, tail)) => tail,
+            None => match find_t_prefix(&out) {
+                Some((_, tail)) => tail,
+                None => return out,
+            },
+        };
+        if next == out {
+            return out;
+        }
+        out = next;
     }
-    if let Some((_, tail)) = find_t_prefix(path) {
-        return tail;
-    }
-    path.to_string()
+    out
 }
 
 #[cfg(test)]
@@ -705,6 +820,30 @@ mod tests {
     #[test]
     fn strips_t_token_prefix() {
         assert_eq!(strip_token_prefix("/t/abc123/manifest.json"), "/manifest.json");
+    }
+
+    /// The doubled token a page can produce when it rebuilds an already-tokenised
+    /// href. Stripping one copy left a path with no route, so the answer was the
+    /// SPA (200 `text/html`) instead of the API — measured on
+    /// `https://stream.pencarimovie.com/<t>/<t>/api/download?short_code=…`,
+    /// which the browser received as HTML and never downloaded.
+    #[test]
+    fn strips_a_doubled_token_prefix() {
+        let t = "66ff097863dedb7ccd8401d5ffe616f3";
+        assert_eq!(
+            strip_token_prefix(&format!("/{t}/{t}/api/download")),
+            "/api/download"
+        );
+        assert_eq!(
+            strip_token_prefix(&format!("/{t}/{t}/manifest.json")),
+            "/manifest.json"
+        );
+        assert_eq!(strip_token_prefix(&format!("/{t}/{t}")), "/");
+        // A token then a `/t/` copy is the same mistake in the other spelling.
+        assert_eq!(
+            strip_token_prefix(&format!("/{t}/t/{t}/api/download")),
+            "/api/download"
+        );
     }
 
     #[test]

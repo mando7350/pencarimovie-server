@@ -3,7 +3,7 @@
 # (Windows/Linux/macOS/Android), the same name as the Android app and the
 # published downloads. Do not reintroduce an engine suffix ("rust"/"port").
 name = "pencarimovie-server"
-version = "3.0.4"
+version = "3.1.0"
 edition = "2024"
 
 # Faithful port of backend.php onto grammers (Telegram) + axum.
@@ -23,9 +23,9 @@ cbc = "0.1"
 # filename patterns that need it.
 fancy-regex = "0.14"
 futures-util = "0.3"
-grammers-client = "0.11.0"
-grammers-session = { version = "0.11.0", default-features = false, features = ["serde"] }
-grammers-tl-types = "0.11.0"
+grammers-client = "0.12.0"
+grammers-session = { version = "0.12.0", default-features = false, features = ["serde"] }
+grammers-tl-types = "0.12.0"
 hex = "0.4"
 # The dashboard is EMBEDDED into the binary (`include_dir!`), so the whole server
 # is one `pencarimovie-server.exe` — no `public/` folder beside it, no PHP.
@@ -65,6 +65,10 @@ ed25519-dalek = "2"
 # FLAC, which streams raw and plays natively. Dropping it also drops its whole
 # codec/container tree from the binary (see README for the measured size).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
+# `StreamReader` turns a reqwest `bytes_stream()` into an `AsyncRead`, which is
+# what lets a backfill pipe the CDN body STRAIGHT into `upload_stream` with no
+# temp file and no full-size buffer. Already in the tree (0.7.20 via reqwest).
+tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = "0.1"
 url = "2"
 # fd_fold_latin_accents() is Unicode NFD + strip-combining-marks. `iconv` is not

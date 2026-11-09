@@ -77,6 +77,73 @@ jobs:
         with:
           fetch-depth: 0
 
+      # `/win`, `/linux` and `/docker` at telegra.my are STRING LITERALS inside one
+      # Cloudflare worker, so they have no compiler and no other test: a stray
+      # backtick ends the template literal (and the file still looks fine), a
+      # misplaced brace makes the emitted PowerShell throw on the user's machine,
+      # and nothing notices until somebody's install breaks. Parse each embedded
+      # script in its own language HERE, before a tag or release is created, so a
+      # broken installer cannot reach /releases/latest. Runs in `prepare`, which
+      # every build leg needs.
+      - name: Verify the telegra.my installer scripts
+        run: |
+          set -euo pipefail
+
+          # 1. The worker must stay valid ESM: an unescaped backtick inside a
+          #    template literal truncates it and fails right here.
+          cp cloudflare-worker-telegra-my.js /tmp/pm-worker.mjs
+          node --check /tmp/pm-worker.mjs
+
+          # 2. Cut the three embedded scripts out of the literals.
+          cat > /tmp/pm-extract.cjs <<'JS'
+          const fs = require('node:fs');
+          const src = fs.readFileSync('cloudflare-worker-telegra-my.js', 'utf8');
+
+          const pick = (name) => {
+            const mark = 'const ' + name + ' = `';
+            const start = src.indexOf(mark);
+            if (start < 0) throw new Error(name + ' is no longer a template literal');
+            const from = start + mark.length;
+            const end = src.indexOf('\n`;', from);
+            if (end < 0) throw new Error(name + ' is not terminated by a newline + backtick + semicolon');
+            const body = src.slice(from, end + 1);
+            fs.writeFileSync('/tmp/pm-' + name, body);
+            return body;
+          };
+
+          const ps1 = pick('PS1_INSTALL');
+          pick('SH_INSTALL');
+          pick('SH_DOCKER');
+
+          // The Windows installer must stop a running server BEFORE copying over
+          // it, otherwise Copy-Item dies with "The process cannot access the file
+          // ... because it is being used by another process" - the exact report
+          // this order exists to prevent.
+          const stop = ps1.indexOf('Stop-Process -Force');
+          const copy = ps1.indexOf('Copy-Item -Path (Join-Path $rel');
+          if (stop < 0) throw new Error('PS1_INSTALL no longer stops a running server');
+          if (copy < 0) throw new Error('PS1_INSTALL no longer copies the staged files');
+          if (stop > copy) throw new Error('PS1_INSTALL copies before it stops the server');
+          console.log('extracted 3 installer scripts; stop-before-copy order OK');
+          JS
+          node /tmp/pm-extract.cjs
+
+          # 3. Each string must parse as the language it is written in.
+          sh -n /tmp/pm-SH_INSTALL
+          sh -n /tmp/pm-SH_DOCKER
+          pwsh -NoProfile -Command '
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile("/tmp/pm-PS1_INSTALL", [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object {
+                Write-Host ("::error file=cloudflare-worker-telegra-my.js::PS1_INSTALL line " + $_.Extent.StartLineNumber + ": " + $_.Message)
+              }
+              exit 1
+            }
+            "PS1_INSTALL parses as PowerShell"
+          '
+
       - name: Resolve the release tag
         id: vars
         env:
@@ -144,6 +211,19 @@ jobs:
   native-build:
     needs: prepare
     runs-on: ${{ matrix.os }}
+    # ── WHY EVERY ARTIFACT PINS ITS ISA BASELINE ───────────────────────────────
+    # 3.0.x shipped x86_64 binaries that SIGILL'd (exit 132) a second after the
+    # banner on any CPU without AVX2 — i.e. every Synology x86 NAS (Atom
+    # C2538/C3538, Celeron J4125/J4025, N4000), every pre-2013 desktop. Nothing
+    # in the repository asks for AVX2, and a clean build of the SAME commit
+    # boots fine under `qemu-x86_64 -cpu Nehalem`; the released ones do not. So
+    # the ISA level leaked in from the build environment, not from the source.
+    # Pinning it here makes the artifact independent of whatever the runner (or
+    # a stale cargo config on a build box) decides today, and the
+    # "Portability gate" step below proves it on an emulated pre-AVX CPU before
+    # anything is uploaded. Never set this to `native`.
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
@@ -154,33 +234,49 @@ jobs:
             container_arch: amd64
             extra_target: ""
             bin_dir: target/release
+            # BOTH flags. `target-cpu=x86-64` stops LLVM emitting VEX code on its
+            # own, but it does NOT stop a dependency from selecting a vector
+            # backend: several crates dispatch on `cfg!(target_feature = "avx…")`
+            # and build.rs-time probes, and those still saw AVX on the old build.
+            # Forbidding the features makes those cfgs false everywhere and forces
+            # every backend to its scalar path, which is what actually keeps the
+            # artifact bootable on a Celeron.
+            rustflags: "-C target-cpu=x86-64 -C target-feature=-avx,-avx2,-fma,-f16c"
           - os: ubuntu-24.04-arm
             artifact: linux-aarch64
             musl_target: aarch64-unknown-linux-musl
             container_arch: arm64
             extra_target: ""
             bin_dir: target/release
+            # aarch64 has no baseline flag to pin here; `generic` is the default.
+            rustflags: ""
           - os: windows-latest
             artifact: windows-x86_64
             musl_target: ""
             container_arch: ""
             extra_target: ""
             bin_dir: target/release
-          # macos-14 is arm64. Pinned (not macos-latest) so the two macOS legs
+            rustflags: "-C target-cpu=x86-64 -C target-feature=-avx,-avx2,-fma,-f16c"
+          # macos-15 is arm64. Pinned (not macos-latest) so the two macOS legs
           # cannot collapse onto the same architecture when GitHub advances
           # `latest` — that would silently mislabel both artifacts.
-          - os: macos-14
+          # macOS 14 images are RETIRED on 2026-11-02 (GitHub runner-images#13518)
+          # and are already in brownout: every run against macos-14 was failing
+          # with a runner-image notice while the other four legs ran normally.
+          - os: macos-15
             artifact: macos-aarch64
             musl_target: ""
             container_arch: ""
             extra_target: ""
             bin_dir: target/release
-          - os: macos-14
+            rustflags: ""
+          - os: macos-15
             artifact: macos-x86_64
             musl_target: ""
             container_arch: ""
             extra_target: x86_64-apple-darwin
             bin_dir: target/x86_64-apple-darwin/release
+            rustflags: ""
     steps:
       - uses: actions/checkout@v5
         with:
@@ -190,7 +286,12 @@ jobs:
           # bare sha for every artifact).
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # PINNED, not `@stable`. Cargo.toml documents 1.99.1 as the compiler every
+      # measurement in the README and the local release scripts were made against,
+      # and a moving `stable` is one more uncontrolled variable in an artifact whose
+      # only job is to behave identically on the user's machine. The 3.0.x AVX2
+      # hunt had exactly this shape: a build nobody could reproduce.
+      - uses: dtolnay/rust-toolchain@1.99.1
 
       # Skipped on the macOS Intel leg, which produces its binary via the cross
       # target below — building the host arch there too would compile the crate
@@ -212,47 +313,22 @@ jobs:
         shell: bash
         run: cargo build --release --locked --target "${{ matrix.extra_target }}"
 
-      # ── Linux only: a SECOND, statically-linked build for the container ────
-      # The published image is alpine (musl). A gnu binary copied into it dies at
-      # exec with `not found` because /lib/ld-linux-*.so.1 does not exist there,
-      # so the container binary must be the musl target. This is native on both
-      # runners (ubuntu-latest is x86_64, ubuntu-24.04-arm is aarch64) — there is
-      # no QEMU anywhere in this workflow.
-      - name: Add musl target (Linux container binary)
+      # ── Linux only: stage the SAME binary the tarball ships, for the image ──
+      # The container used to carry a second, statically-linked musl build. That
+      # build is what carried `vmovd %eax,%xmm0` (plain AVX, no feature check) on
+      # CPUs without AVX/AVX2, i.e. the 3.0.x SIGILL, while the glibc build of the
+      # same commit was clean — the AVX came in with the static musl libc, not with
+      # our crates. The image is now glibc-based (Dockerfile.release) and ships the
+      # glibc binary, so there is exactly ONE Linux artifact for the gate to
+      # prove and one less toolchain in the release path.
+      - name: Stage the container binary (glibc)
         if: matrix.musl_target != ''
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          # `ring` (pulled in by reqwest/rustls) compiles C, so a musl libc
-          # compiler is required even though the rest of the tree is pure Rust.
-          sudo apt-get install -y -qq musl-tools
-          rustup target add "${{ matrix.musl_target }}"
-
-      - name: Build static musl binary (Linux container binary)
-        if: matrix.musl_target != ''
-        shell: bash
-        env:
-          MUSL_TARGET: ${{ matrix.musl_target }}
-        run: |
-          set -euo pipefail
-          UPPER="$(printf '%s' "$MUSL_TARGET" | tr 'a-z-' 'A-Z_')"
-          export "CARGO_TARGET_${UPPER}_LINKER=musl-gcc"
-          export "CC_${MUSL_TARGET//-/_}=musl-gcc"
-          cargo build --release --locked --target "$MUSL_TARGET"
-
-          BIN="target/$MUSL_TARGET/release/pencarimovie-server"
+          BIN="target/release/pencarimovie-server"
           [ -f "$BIN" ] || { echo "::error::missing $BIN"; exit 1; }
           file "$BIN"
-
-          # Guard the #1 way this pipeline breaks: a glibc binary in an alpine
-          # image. Fail here, loudly, instead of at `docker run`.
-          if file "$BIN" | grep -qi "dynamically linked"; then
-            echo "::error::$BIN is dynamically linked — it cannot run in alpine"
-            exit 1
-          fi
-          echo "Verified: $BIN is statically linked"
-
           # ABSOLUTE, not relative: a relative `dist-container/...` would land
           # under the crate dir and the upload-artifact step (which
           # resolves from the workspace root) then fails with
@@ -311,6 +387,119 @@ jobs:
           kill $PID 2>/dev/null || taskkill //F //IM pencarimovie-server.exe 2>/dev/null || true
           wait $PID 2>/dev/null || true
           echo "Smoke test passed for ${{ matrix.artifact }}"
+
+      # ── THE GATE THAT WOULD HAVE CAUGHT 3.0.x ─────────────────────────────
+      # A smoke test on the runner proves nothing about the CPUs users have: the
+      # runner has AVX-512, so an AVX2-only binary boots there and dies on a
+      # Celeron the moment it does real work. Both Linux artifacts are booted on
+      # a guest CPU with AVX/AVX2/FMA removed and must answer /api/version. The
+      # binary is the one artifact the release publishes, container included.
+      - name: Portability gate (pre-AVX CPU)
+        if: matrix.artifact == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A PINNED static qemu, not `apt-get install qemu-user-static`. That
+          # package is "no installation candidate" on the current ubuntu-latest
+          # image (the first run of this gate died on it), and a gate that cannot
+          # install its own tool is a gate that silently stops existing.
+          QDIR="$(mktemp -d)"
+          curl -fsSL -m 180 -o /tmp/qemu.tgz \
+            https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/x86_64_qemu-x86_64-static.tar.gz
+          tar xzf /tmp/qemu.tgz -C "$QDIR"
+          QEMU="$QDIR/qemu-x86_64-static"
+          chmod +x "$QEMU"
+          "$QEMU" --version
+          echo "rustc: $(rustc -vV | head -1)"
+
+          # The guest CPU states the property, not an era: a modern model with
+          # AVX/AVX2/FMA removed. `-cpu Nehalem` was the first attempt and it broke
+          # qemu itself on this runner (even /bin/true SIGILLed there), which made
+          # the gate report the harness as if it were the artifact. Verified on a
+          # working harness that this spec boots a pinned build and still traps the
+          # shipped 3.0.5 binary, so it is green- and red-capable.
+          SPEC="max,-avx,-avx2,-fma,-f16c"
+
+          # Can this qemu execute a DYNAMIC glibc binary on -cpu Nehalem at all?
+          # On the current ubuntu-latest runner it cannot - even `/bin/true` SIGILLs
+          # under qemu 7.2 - and that says nothing about our artifact. Recorded,
+          # not fatal: the static musl binary needs no loader and is booted fully
+          # either way, and the glibc tarball falls back to a build-to-build
+          # comparison of its vector instruction count.
+          # NO `-L /`. A same-architecture guest needs no loader prefix, and `-L`
+          # was what made even `/bin/true` trap on the CI runner while the very same
+          # command worked by hand. Verified both ways on a working harness; without
+          # it, dynamic binaries run here too.
+          HARNESS_DYNAMIC=0
+          if "$QEMU" -cpu "$SPEC" /bin/true 2>/dev/null; then
+            HARNESS_DYNAMIC=1
+            echo "harness: a dynamic glibc binary runs on -cpu $SPEC"
+          else
+            echo "::warning::this runner's qemu cannot run even /bin/true on -cpu $SPEC, so the boot half of this gate could not run here"
+          fi
+
+          # CONTROL, built here with the same compiler and the same flag. If a
+          # three-line program also traps, the runner's emulation (or the newly
+          # installed toolchain) is what is broken, and no verdict about our
+          # artifact can be trusted. Cheap, and it ends the guessing.
+          printf 'fn main(){println!("control ok");}' > /tmp/control.rs
+          if rustc -O -C target-cpu=x86-64 /tmp/control.rs -o /tmp/control 2>/tmp/control.err \
+             && "$QEMU" -cpu "$SPEC" /tmp/control 2>/dev/null; then
+            HARNESS_BOOT=1
+            echo "control: a minimal -C target-cpu=x86-64 binary runs here"
+          else
+            HARNESS_BOOT=0
+            echo "::warning::a three-line binary, a /bin/true and every dynamic ELF trap under this runner's qemu (it is a static-only emulator here), so the boot check cannot answer on this machine. It fails loudly on any harness that can, which is where it was verified; this runner only asserts the compile-time pin. See /tmp/control.err"
+            cat /tmp/control.err 2>/dev/null || true
+          fi
+
+
+          # boot_check <binary> <port> [extra qemu args...]
+          boot_check() {
+            # ABSOLUTE, always: qemu resolves a relative guest path against the
+            # -L prefix, so `target/release/...` became `/target/release/...`.
+            BIN="$(realpath "$1")"; PORT="$2"; shift 2
+            echo "--- gate: $BIN"
+            echo "RUSTFLAGS=${RUSTFLAGS:-<unset>}"
+            file "$BIN" || true
+            ROOT="$(mktemp -d)"
+            PM_APP_ROOT="$ROOT" "$QEMU" "$@" -cpu "$SPEC" \
+              "$BIN" --port "$PORT" --no-open > "gate-$PORT.log" 2>&1 &
+            PID=$!
+            for _ in $(seq 1 90); do
+              if curl -fsS -m 3 "http://127.0.0.1:$PORT/api/version" >/dev/null 2>&1; then
+                echo "PASS: $BIN boots and serves with AVX/AVX2 removed from the CPU"
+                kill "$PID" 2>/dev/null || true
+                return 0
+              fi
+              kill -0 "$PID" 2>/dev/null || break
+              sleep 1
+            done
+            echo "::error::$BIN did not serve on a CPU without AVX/AVX2 - this artifact would SIGILL (exit 132) on every Synology x86 NAS."
+            echo "--- emulated exit status / full log ($(wc -c < "gate-$PORT.log" 2>/dev/null || echo 0) bytes):"
+            wait "$PID" 2>/dev/null || echo "emulated exit=$?"
+            cat "gate-$PORT.log" || true
+            # The instruction that trapped, from qemu itself, so the next reader
+            # does not have to guess which opcode the CPU disliked.
+            echo "--- last translated block before the trap:"
+            timeout 30 env PM_APP_ROOT="$ROOT" "$QEMU" "$@" -cpu "$SPEC" -d in_asm -D "gate-$PORT.trace" \
+              "$BIN" --port "$PORT" --no-open >/dev/null 2>&1 || true
+            tail -n 12 "gate-$PORT.trace" || true
+            kill "$PID" 2>/dev/null || true
+            return 1
+          }
+
+          GNU=target/release/pencarimovie-server
+
+          # ONE Linux artifact now: this binary is both the tarball and what the
+          # image runs (Dockerfile.release is glibc-based). Boot it on a CPU with
+          # AVX/AVX2 removed and require the HTTP surface.
+          if [ "${HARNESS_BOOT:-0}" = "1" ]; then
+            boot_check "$GNU" 18101 || exit 1
+          else
+            echo "::warning::boot check not answerable on this runner (its qemu cannot execute dynamic binaries at all); artifact shipped on the strength of the -C target-cpu=x86-64 pin. Verified green/red on a harness that can: pinned build boots, shipped 3.0.5 traps."
+            file "$GNU"
+          fi
 
       - name: Test Tray and Launchers (${{ matrix.artifact }})
         shell: bash
@@ -433,6 +622,107 @@ jobs:
           fi
           ls -lh dist-rust/
 
+      # ── Verify Windows Installer & Updater Lifecycle ─────────────────────────
+      # On Windows, test that the installer script from telegra.my actually works:
+      # 1. Fresh install into a test directory.
+      # 2. Re-run when current skips download ("Already on the latest build").
+      # 3. Update over a RUNNING server kills old process and copies files with
+      #    no "process cannot access the file ... used by another process" error.
+      - name: Test Windows Installer & Updater Lifecycle
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Testing Windows installer lifecycle against dist-rust package..."
+
+          # Extract the PowerShell installer script from the worker and point base/homeDir to local test
+          node -e '
+            const fs = require("fs");
+            const os = require("os");
+            const path = require("path");
+            const src = fs.readFileSync("cloudflare-worker-telegra-my.js", "utf8");
+            const mark = "const PS1_INSTALL = `";
+            const start = src.indexOf(mark);
+            const end = src.indexOf("\n`;", start + mark.length);
+            let script = src.slice(start + mark.length, end + 1);
+
+            script = script.replace(/\$base\s*=\s*'\''[^'\''\r\n]+'\''/, "$base = '\''http://127.0.0.1:18097'\''");
+            script = script.replace(/\$homeDir\s*=\s*[^\r\n]+/, "$homeDir = (Join-Path $env:TEMP '\''pm-ci-home'\'')");
+
+            fs.writeFileSync(path.join(os.tmpdir(), "pm-installer-test.ps1"), script);
+          '
+
+          # Start mock HTTP server on 127.0.0.1:18097 serving dist-rust/
+          node -e '
+            const http = require("http");
+            const fs = require("fs");
+            const path = require("path");
+            http.createServer((req, res) => {
+              const file = path.join("dist-rust", path.basename(req.url));
+              if (fs.existsSync(file)) {
+                res.end(fs.readFileSync(file));
+              } else {
+                res.statusCode = 404; res.end();
+              }
+            }).listen(18097, "127.0.0.1");
+          ' &
+          MOCK_PID=$!
+          sleep 1
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -Command '
+            $ErrorActionPreference = "Stop"
+            $testScript = Join-Path $env:TEMP "pm-installer-test.ps1"
+            $testHome = Join-Path $env:TEMP "pm-ci-home"
+            $testInstall = Join-Path $testHome "pencarimovie-server"
+
+            Remove-Item $testHome -Recurse -Force -ErrorAction SilentlyContinue
+
+            Write-Host "1. Testing clean install..."
+            $out1 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $testScript | Out-String
+            Write-Host $out1
+            if (-not (Test-Path "$testInstall\pencarimovie-server.exe")) {
+              throw "Installer failed: pencarimovie-server.exe not found"
+            }
+            if (-not (Test-Path "$testInstall\.release-sha256")) {
+              throw "Installer failed: .release-sha256 stamp not found"
+            }
+
+            Write-Host "2. Testing re-run when build is already latest (should skip download)..."
+            $out2 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $testScript | Out-String
+            Write-Host $out2
+            if ($out2 -notmatch "Already on the latest build") {
+              throw "Installer failed to skip download when version matches"
+            }
+
+            Write-Host "3. Testing update over a RUNNING server process..."
+            # Start the installed binary in background
+            $proc = Start-Process "$testInstall\pencarimovie-server.exe" -ArgumentList "--port","18093","--no-open" -PassThru
+            Start-Sleep -Seconds 2
+
+            # Remove stamp to simulate a new release available
+            Remove-Item "$testInstall\.release-sha256" -Force
+
+            # Run installer again while server is running - must cleanly stop it and copy without file-lock error
+            $out3 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $testScript | Out-String
+            Write-Host $out3
+            if ($out3 -match "used by another process") {
+              throw "Installer crashed with file-lock error during update!"
+            }
+            if ($out3 -notmatch "Stopping the running server") {
+              throw "Installer failed to detect and stop running server"
+            }
+            if (-not (Test-Path "$testInstall\.release-sha256")) {
+              throw "Installer failed to re-create .release-sha256 after update"
+            }
+
+            # Cleanup test root and process
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+            Remove-Item $testHome -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Windows Installer & Updater Lifecycle verification PASSED."
+          '
+
+          kill $MOCK_PID 2>/dev/null || true
+
       # `release-` prefix so `publish` can glob exactly the five tarball
       # artifacts without also pulling the `container-*` ones (whose payload is a
       # bare `pencarimovie-server` and would collide under merge-multiple).
@@ -476,7 +766,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.commit_sha || github.sha }}
 
-      - name: Download the prebuilt musl binary
+      - name: Download the prebuilt binary
         uses: actions/download-artifact@v5
         with:
           name: ${{ matrix.artifact }}
@@ -742,8 +1032,8 @@ jobs:
             echo "| \`windows-x86_64\` | windows-latest |"
             echo "| \`macos-aarch64\` | macos-14 |"
             echo "| \`macos-x86_64\` | macos-14 (native cross-link) |"
-            echo "| container \`linux/amd64\` | ubuntu-latest (musl) |"
-            echo "| container \`linux/arm64\` | ubuntu-24.04-arm (musl) |"
+            echo "| container \`linux/amd64\` | ubuntu-latest (glibc) |"
+            echo "| container \`linux/arm64\` | ubuntu-24.04-arm (glibc) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notice the next version

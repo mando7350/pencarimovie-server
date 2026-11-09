@@ -554,6 +554,7 @@ class PencariMovieApp {
     const addonStremioDirectBtn = this.$("#addonStremioDirectBtn");
     const addonStremioLocalDirectBtn = this.$("#addonStremioLocalDirectBtn");
     const addonStremioSync = this.$("#addonStremioSync");
+    const addonSyncCard = this.$("#addonSyncCard");
     const addonNuvioInstructions = this.$("#addonNuvioInstructions");
     const copiedStatus = this.$("#addonCopiedStatus");
     const stremioSyncUrlPreview = this.$("#stremioSyncUrlPreview");
@@ -1216,7 +1217,19 @@ class PencariMovieApp {
       }
       const ipv4 = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
       if (!ipv4) {
-        return value !== "127.0.0.1";
+        // A NAME is a LAN host only when it is mDNS (`.local`). Everything else
+        // with letters in it is a real DNS name — a domain, a PaaS hostname, the
+        // tunnel — and the token MUST stay in its addon URL.
+        //
+        // This used to be `return value !== "127.0.0.1"`, which is true for any
+        // hostname, so `tokenForHost()` stripped the token from
+        // `…onrender.com/manifest.json` and the dashboard printed a public
+        // SERVER MANIFEST URL with no token — the 2026-11-03 report "Server
+        // Manifest … no token!", whose consequence is the locked "Addon URL
+        // changed or password required" card on every installed client.
+        // Loopback/LAN keep omitting the token on purpose (the server treats
+        // those peers as privileged, and a pasteable URL should stay readable).
+        return /\.local$/i.test(value);
       }
       const a = Number(ipv4[1]);
       const b = Number(ipv4[2]);
@@ -1238,10 +1251,30 @@ class PencariMovieApp {
       // be handed to the music addon: that IP changes with DHCP. Only a real
       // hostname (a domain, or the tunnel) is a stable address.
       const pageHostIsLan = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(pageHost) || /\.local$/i.test(pageHost) || pageHost === "0.0.0.0";
-      const localUrl = "http://127.0.0.1".concat(portSuffix).concat(tokenPrefix, "/manifest.json");
-      let serverUrl = !isLocal && !onTunnel ? "".concat(window.location.origin.replace(/\/+$/, "")).concat(tokenPrefix, "/manifest.json") : "";
+      // Loopback and private-LAN hosts pass the server's own trust check
+      // (`auth::is_local_request`), so a token in those URLs buys nothing — and it
+      // turns a URL the user is meant to paste into a client into a URL they cannot
+      // screenshot or dictate. Only a public origin or the tunnel carries it.
+      const tokenForHost = host => {
+        const h = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
+        if (!h || h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0") {
+          return "";
+        }
+        if (isUsableLanHost(h)) {
+          return "";
+        }
+        // Public origin: the token is mandatory, even if we somehow do not have it
+        // loaded yet — a URL without it is a URL that answers the locked card, so
+        // say so in the log rather than print a broken manifest address.
+        if (!tokenPrefix) {
+          console.warn("[addon] public host without an access token — log in so the manifest URL carries it:", h);
+        }
+        return tokenPrefix;
+      };
+      const localUrl = "http://127.0.0.1".concat(portSuffix, "/manifest.json");
+      let serverUrl = !isLocal && !onTunnel ? "".concat(window.location.origin.replace(/\/+$/, "")).concat(tokenForHost(pageHost), "/manifest.json") : "";
       const lanHost = isUsableLanHost(this.lanIp) ? this.lanIp : isUsableLanHost(pageHost) ? pageHost : "";
-      const lanUrl = lanHost ? "http://".concat(lanHost).concat(portSuffix).concat(tokenPrefix, "/manifest.json") : "";
+      const lanUrl = lanHost ? "http://".concat(lanHost).concat(portSuffix, "/manifest.json") : "";
       let tunnelUrl = "";
       if (this.tunnelEnabled || onTunnel) {
         if (this.tunnelPublicUrl) {
@@ -1274,7 +1307,7 @@ class PencariMovieApp {
       } else if (tunnelUrl) {
         musicBase = "".concat(tunnelUrl).concat(tokenPrefix);
       } else {
-        musicBase = "http://127.0.0.1".concat(portSuffix).concat(tokenPrefix);
+        musicBase = "http://127.0.0.1".concat(portSuffix);
       }
       const eclipseUrl = "".concat(musicBase, "/music/manifest.json");
       return {
@@ -1403,7 +1436,9 @@ class PencariMovieApp {
       }
       if (addonModalTitle) addonModalTitle.textContent = "\u{1F9E9} Nuvio / Stremio Addon";
       if (addonModalDesc) {
-        addonModalDesc.textContent = isHttps ? "Copy a manifest URL for Nuvio, or click Add to Stremio." : "Copy a manifest URL for Nuvio, or install an address into Stremio via API sync.";
+        addonModalDesc.textContent = isHttps
+          ? "Copy a manifest URL for Nuvio, or add it to Stremio in one tap."
+          : "Copy a manifest URL for Nuvio, or install the address into Stremio from this page.";
       }
       if (addonLanField) {
         const showLan = isLocal && !onTunnel && Boolean(lanUrl);
@@ -1416,25 +1451,46 @@ class PencariMovieApp {
       if (addonTunnelField) {
         addonTunnelField.classList.toggle("hidden", !tunnelManifest);
       }
+      // The HTTP API install card exists for ONE case: the manifest is a plain
+      // http address (localhost, or a LAN IP) and Stremio Web refuses to add it.
+      // On an https origin (a tunnel, or a served domain) the manifest is already
+      // something Stremio can add directly, so asking for a Stremio password there
+      // buys nothing: the whole card is hidden instead.
+      const localInstallOnly = isHttps;
+      if (addonSyncCard) {
+        addonSyncCard.classList.toggle("hidden", localInstallOnly);
+      }
       if (addonStremioSync) {
-        addonStremioSync.classList.toggle("hidden", isHttps);
+        addonStremioSync.classList.remove("hidden");
       }
       if (addonNuvioInstructions) {
         addonNuvioInstructions.classList.remove("hidden");
       }
-      if (!isHttps) {
+      if (!localInstallOnly) {
         updateStremioSyncPreview();
       }
-      // Search on pencarimovie.com (Settings overlay). Mirrors backend.php's
-      // no-streams fallback URL:
-      //   'https://pencarimovie.com/search/?ddldomain=' . rawurlencode(rtrim($baseUrl, '/'))
-      // $baseUrl there is the origin the CLIENT used (fd_get_stremio_base_url()), so
-      // this uses the page's own origin: localhost / LAN / tunnel as opened.
+      // Search on pencarimovie.com (Settings overlay). Mirrors the engine's
+      // no-streams fallback URL (routes::no_streams_card → ddl_domain_value()):
+      //   'https://pencarimovie.com/search/?ddldomain=' . rawurlencode(<origin>[/token])
+      //
+      // The TOKEN matters. A non-loopback origin (LAN IP, tunnel, custom domain)
+      // is auth-gated, so `ddldomain=<origin>` alone made every download button on
+      // that page answer 401 — the "no stream found" symptom again, this time from
+      // the dashboard's own button. The token rides in the PATH (`/<token>`), the
+      // transport strip_token_prefix() and the WordPress plugin both understand,
+      // and only where it is needed: loopback is privileged already.
       const settingsSearchWebsiteBtn = this.$("#settingsSearchWebsiteBtn");
       if (settingsSearchWebsiteBtn) {
-        const ddldomain = window.location.origin;
+        const ddlOrigin = window.location.origin;
+        const ddlHost = String(window.location.hostname || "").toLowerCase();
+        const ddlLoopback = ddlHost === "localhost" || ddlHost.endsWith(".localhost") ||
+          ddlHost === "::1" || ddlHost === "[::1]" || /^127\./.test(ddlHost);
+        const ddlToken = ddlLoopback ? "" : String(this._authToken || "").trim();
+        const ddldomain = ddlOrigin + (ddlToken ? "/" + encodeURIComponent(ddlToken) : "");
         settingsSearchWebsiteBtn.href = "https://pencarimovie.com/search/?ddldomain=" + encodeURIComponent(ddldomain);
-        settingsSearchWebsiteBtn.title = "Download domain: " + ddldomain;
+        // The tooltip names the origin only: it is read on a shared screen more
+        // often than the href is, and the token is a credential.
+        settingsSearchWebsiteBtn.title = "Download domain: " + ddlOrigin;
       }
     };
     this._updateAddonModalUrls = updateAddonModalUrls;

@@ -15,7 +15,7 @@
     <link rel="stylesheet" href="styles.css?v=20261024music2" />
     <!-- last on purpose: the Titanium tokens must win over the legacy
          media-shell stylesheets for the relocated settings markup -->
-    <link rel="stylesheet" href="dashboard.css?v=20261028dash26" />
+    <link rel="stylesheet" href="dashboard.css?v=20261105livestats5" />
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
@@ -281,8 +281,61 @@
               </div>
             </div>
 
+            <div class="pm-card" id="pmLiveCard">
+              <h2 class="pm-h2">Live</h2>
+              <!-- Every tile answers a question in words, and carries the words that
+                   make its number mean something. "Memory 617 MB of 1 GB" is a fact;
+                   "RAM 617 MB / 62 GB" was the dyno HOST's RAM, which nobody can act
+                   on. Disk and cache are deliberately absent: one is the host's
+                   ephemeral volume, the other is a tuning number with no user meaning.
+                   They stay available at /api/cache/stats and in the reports. -->
+              <div class="pm-statgrid" id="pmLiveGrid">
+                <div class="pm-stat" data-state="ok" id="pmLiveStreams">
+                  <span class="pm-stat__label">Watching</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">players / different titles</small>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveOnline">
+                  <span class="pm-stat__label">People online</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">seen in the last 5 min</small>
+                </div>
+                <!-- Bots are a POOL: "2 / 3 up" is healthy members over pool size.
+                     A single "Connected" hid the two bots that were flood-waited. -->
+                <div class="pm-stat" data-state="ok" id="pmLiveBots">
+                  <span class="pm-stat__label">Bots</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit">up</span>
+                  <small class="pm-stat__note">able to stream right now</small>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveCpu">
+                  <span class="pm-stat__label">CPU</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">of one core</small>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveRam">
+                  <span class="pm-stat__label">Memory</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note" id="pmLiveRamNote">in use</small>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveUptime">
+                  <span class="pm-stat__label">Running for</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">since the last restart</small>
+                </div>
+              </div>
+            </div>
+
             <div class="pm-card" id="pmSetupCard">
               <h2 class="pm-h2">Finish setup</h2>
+              <!-- Every row here, including "The PencariMovie API answers", is rendered
+                   by `renderChecklist()` from a live endpoint. The list hides itself and
+                   only #pmChecklistReady shows once nothing is wrong. -->
               <ul class="pm-checklist" id="pmChecklist"></ul>
               <p class="pm-done hidden" id="pmChecklistReady">All set. Every step below is done.</p>
             </div>
@@ -301,8 +354,10 @@
             <details class="pm-details">
               <summary class="pm-details__summary">Access token</summary>
               <p class="pm-hint">
-                This token is part of every address below. Regenerate it only if it has
-                leaked; every client will then need the new address.
+                Only the public (server and tunnel) addresses below carry this token — a
+                localhost or Wi-Fi address never needs it, so it is left out there.
+                Regenerate it only if it has leaked; every public client will then need
+                the new address.
               </p>
               <div class="addon-catalog-card" id="addonTokenCard">
           <div class="addon-catalog-card__header">
@@ -565,21 +620,20 @@
             Add to Stremio
           </a>
         </div>
-              <div class="pm-card pm-card--inset">
-                <h3 class="pm-h3">Install without copying</h3>
+              <div class="pm-card pm-card--inset" id="addonSyncCard">
+                <h3 class="pm-h3">Install in Stremio from this page</h3>
                 <p class="pm-hint">
-                  Sends the address above to your Stremio account from this browser.
-                  Credentials go only to api.strem.io and are never stored on this server.
+                  Local and LAN only. Stremio Web will not accept a plain http addon
+                  address, so this page sends the http manifest to your Stremio account
+                  through Stremio's own API.
                 </p>
                 <div class="addon-stremio-sync" id="addonStremioSync">
           <div class="addon-stremio-sync__title">
             Install in Stremio (HTTP API Sync)
           </div>
           <p class="addon-stremio-sync__desc">
-            Stremio Web blocks HTTP addon URLs. This sends the selected HTTP
-            manifest to your Stremio account from the browser. Credentials go
-            only to
-            <code>api.strem.io</code> — nothing is stored on this server.
+            Your credentials go only to <code>api.strem.io</code>. Nothing is
+            stored on this server.
           </p>
 
           <div
@@ -1811,7 +1865,7 @@
     <!-- fetch / Object.entries / closest / AbortController for old WebViews
          (Android 5.1 = Chromium 39). No-ops on modern engines. -->
     <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
-    <script defer src="app.js?v=20261028dash27"></script>
-    <script defer src="dashboard.js?v=20261028dash25"></script>
+    <script defer src="app.js?v=20261105ddltoken"></script>
+    <script defer src="dashboard.js?v=20261105livestats7"></script>
   </body>
 </html>

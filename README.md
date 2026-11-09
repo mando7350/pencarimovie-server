@@ -101,9 +101,14 @@ docker run -d \
   --name pencarimovie-server \
   --restart unless-stopped \
   -p 8088:8088 \
-  -v pencarimovie-data:/app/storage \
+  -v pencarimovie-data:/data \
   ghcr.io/aiskendi/pencarimovie-server:latest
 ```
+
+The image runs as uid 10001 with `PM_APP_ROOT=/data`, so the volume must be
+mounted on **`/data`** (a `/app/storage` mount is silently ignored and every
+restart starts from an empty install). With a bind mount, make the host directory
+writable by that uid: `sudo chown -R 10001:10001 ./storage`.
 
 Once started, open the web dashboard:
 **`http://127.0.0.1:8088`** _(or the local LAN IP printed in your terminal)_
@@ -124,21 +129,6 @@ Deploy your personal PencariMovie Server to the cloud with a single click:
 > **Permanent Addon URL on Cloud / PaaS**:
 > Always set a static **`SERVER_TOKEN`** (such as `66ff097863dedb7ccd8401d5ffe616f2`) in your cloud provider's environment variables. This keeps your Stremio or Nuvio manifest URL (`https://<your-app>.up.railway.app/<token>/manifest.json`) permanent so you do not need to re-install addons when your container restarts or redeploys.
 
-> **Heroku repository lookup rate limit**:
-> If Heroku shows "Unable to connect to aiskendi/pencarimovie-server: this repository is either private or does not exist", the repository is public, but Heroku's unauthenticated lookup hit GitHub's 60 requests/hour IP limit. Choose either fix:
->
-> 1. **Authorize GitHub in Heroku**: Click _authenticate to continue_ on the error page (or go to Account Settings > Applications > Connect to GitHub) so Heroku uses authenticated API requests (5,000/hour), then reopen the deploy button.
-> 2. **Push the container build directly**:
->
-> ```bash
-> heroku create <app-name> --stack container
-> heroku git:remote -a <app-name>
-> git push heroku main                          # heroku.yml builds the Dockerfile
-> heroku config:set SERVER_TOKEN=<32+ char secret>
-> ```
->
-> Then run `heroku open` (or check `/api/version` for a liveness check).
-
 ---
 
 ## Docker & Environment Variables
@@ -158,7 +148,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./storage:/app/storage
+      - ./storage:/data
 ```
 
 ### Environment Variables (`.env`)
@@ -211,7 +201,7 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 | `PM_MAX_STREAMS`  | `0`                  | Maximum simultaneous streams. `0` = unlimited (the default). Set a limit only on hosts with short request timeouts so clients receive an immediate `503` with `Retry-After` instead of timing out at the proxy. |
 | `PM_PIPELINE`     | _(auto)_             | Download pipeline depth (`0` = auto).                                                                                                                                                                           |
 | `PM_CACHE_DB`     | `storage/cache.redb` | Cache database path; `off` keeps the cache in memory only.                                                                                                                                                      |
-| `PM_LISTEN_HOST`  | _(auto)_             | Bind address: loopback locally, all interfaces on a PaaS.                                                                                                                                                       |
+| `PM_LISTEN_HOST`  | `0.0.0.0`            | Bind address: all interfaces by default (`127.0.0.1` for loopback only).                                                                                                                                        |
 
 ---
 

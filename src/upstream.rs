@@ -900,6 +900,365 @@ pub async fn episode_names(
     names
 }
 
+/// Titles of the OTHER episodes of the same season.
+///
+/// These exist to keep the episode-title guard strict in the RIGHT direction.
+/// A file whose post-marker text names a DIFFERENT known episode is that other
+/// episode and must stay out; a file whose text matches nothing we know is
+/// simply named differently and must NOT be dropped.
+///
+/// Measured, and the reason this exists: Disney's "Oswald" is numbered 1..52 by
+/// theTVDB, while the uploader ships TWO segments per file — TVDB calls S01E02
+/// "The Camping Trip" and the file says "S01E02 Sleepover & Big Banana". The
+/// guard read that as "another episode's title" and rejected every Oswald file
+/// but the combined packs, so every episode answered "No Streams Found" while
+/// the origin held 50 of them.
+///
+/// Same cache discipline as [`episode_names()`]: 7 d for names, 1 h for
+/// "verified but no names", 5 min for a transport failure.
+pub async fn sibling_episode_names(
+    settings: &Value,
+    media_id: &str,
+    season: i32,
+    episode: i32,
+    expected_title: &str,
+    expected_year: &str,
+) -> Vec<String> {
+    let media_id = strip_episode_suffix(media_id);
+    if media_id.is_empty()
+        || !episode_id_re().is_match(&media_id).unwrap_or(false)
+        || season < 1
+        || episode < 1
+    {
+        return Vec::new();
+    }
+    let mut urls: Vec<(String, String)> = Vec::new();
+    for (i, up) in resolver_manifests(settings)
+        .await
+        .into_iter()
+        .take(MAX_NAME_PROVIDERS)
+        .enumerate()
+    {
+        let manifest = up.url.trim();
+        if manifest.is_empty() || !(manifest.starts_with("http://") || manifest.starts_with("https://")) {
+            continue;
+        }
+        urls.push((
+            format!("up_{}", i),
+            format!("{}/meta/series/{}.json", base_of(manifest), rawurlencode(&media_id)),
+        ));
+    }
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    let cache_key = crate::fileid::md5_hex(
+        json!([
+            "v1-siblings",
+            media_id.to_lowercase(),
+            season,
+            episode,
+            crate::matcher::norm_title_for_match(expected_title),
+            expected_year.trim(),
+            urls.iter().map(|(_, u)| u.clone()).collect::<Vec<_>>(),
+        ])
+        .to_string()
+        .as_bytes(),
+    );
+    if let Some(hit) = crate::cache::get("episode_siblings", &cache_key) {
+        if let Some(list) = hit.get("names").and_then(|v| v.as_array()) {
+            return list
+                .iter()
+                .filter_map(|v| v.as_str().map(|x| x.to_string()))
+                .collect();
+        }
+    }
+    let bodies = futures_util::future::join_all(urls.iter().map(|(_, url)| {
+        let url = url.clone();
+        async move { crate::httpc::get_contents(&url, NAME_FETCH_TIMEOUT_SECS, HashMap::new()).await }
+    }))
+    .await;
+    let mut verified = false;
+    let mut names: Vec<String> = Vec::new();
+    for body in bodies.iter() {
+        let Some(text) = body else { continue };
+        let Ok(doc) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let meta = doc.get("meta").unwrap_or(&Value::Null);
+        if !meta.is_object() || !episode_meta_identity_matches(meta, &media_id, expected_title, expected_year) {
+            continue;
+        }
+        verified = true;
+        let candidate = extract_sibling_names(meta, season, episode);
+        if !candidate.is_empty() {
+            names = candidate;
+            break;
+        }
+    }
+    let ttl = if !names.is_empty() {
+        TTL_NAMES
+    } else if verified {
+        TTL_VERIFIED_EMPTY
+    } else {
+        TTL_TRANSPORT
+    };
+    crate::cache::put(
+        "episode_siblings",
+        &cache_key,
+        &json!({"names": names, "ttl": ttl}),
+        ttl,
+        0,
+    );
+    names
+}
+
+/// The season a meta's OWN video entry for `item_id` belongs to, or `0`.
+///
+/// An addon can publish one season of a show as a separate item whose episodes
+/// are numbered from 1: AIOMetadata lists Black Clover season 2 as `kitsu:50024`
+/// with 13 videos, and the ids of those videos (`kitsu:50024:1` … `:13`) are the
+/// ids the client asks about. The parent record still says which SEASON each id
+/// belongs to — measured: `kitsu:50024:2` carries `season: 2` while
+/// `kitsu:13209:16` carries `season: 1` — which is the only thing that tells the
+/// two apart, because the metadata's `name` is just "Black Clover" for both.
+pub fn video_season_episode_for_item(meta: &Value, item_id: &str) -> Option<(i32, i32)> {
+    let want = item_id.trim().to_ascii_lowercase();
+    if want.is_empty() {
+        return None;
+    }
+    let videos = meta.get("videos").and_then(|v| v.as_array())?;
+    for video in videos {
+        let id = video
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if id != want {
+            continue;
+        }
+        let season = video.get("season").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let episode = video
+            .get("episode")
+            .or_else(|| video.get("number"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        if season > 0 && episode > 0 {
+            return Some((season, episode));
+        }
+    }
+    None
+}
+
+/// [`video_season_for_item()`] for a live item: fetches the same meta
+/// [`episode_names()`] does (so the second call is a cache hit) and reports the
+/// season the item's own video entry belongs to.
+#[allow(clippy::too_many_arguments)]
+pub async fn episode_item_position(
+    settings: &Value,
+    media_id: &str,
+    item_id: &str,
+    expected_title: &str,
+    expected_year: &str,
+) -> Option<(i32, i32)> {
+    let media_id = strip_episode_suffix(media_id);
+    if media_id.is_empty() || item_id.trim().is_empty() {
+        return None;
+    }
+    let mut urls: Vec<String> = Vec::new();
+    for up in resolver_manifests(settings)
+        .await
+        .into_iter()
+        .take(MAX_NAME_PROVIDERS)
+    {
+        let manifest = up.url.trim();
+        if manifest.is_empty() || !(manifest.starts_with("http://") || manifest.starts_with("https://")) {
+            continue;
+        }
+        urls.push(format!(
+            "{}/meta/series/{}.json",
+            base_of(manifest),
+            rawurlencode(&media_id)
+        ));
+    }
+    if urls.is_empty() {
+        return None;
+    }
+    let bodies = futures_util::future::join_all(urls.iter().map(|url| {
+        let url = url.clone();
+        async move { crate::httpc::get_contents(&url, NAME_FETCH_TIMEOUT_SECS, HashMap::new()).await }
+    }))
+    .await;
+    for body in bodies.iter() {
+        let Some(text) = body else { continue };
+        let Ok(doc) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let meta = doc.get("meta").unwrap_or(&Value::Null);
+        if !meta.is_object()
+            || !episode_meta_identity_matches(meta, &media_id, expected_title, expected_year)
+        {
+            continue;
+        }
+        if let Some(pos) = video_season_episode_for_item(meta, item_id) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// The ABSOLUTE episode number of `(season, episode)`, or `0` when the meta
+/// cannot say.
+///
+/// Plenty of long-running shows are uploaded as ONE continuous run
+/// (`Naruto.E84.mkv`, no season marker) while the addon splits them into
+/// theTVDB seasons — Naruto is S1 35, S2 48, S3 48 … so S03E01 is absolute
+/// episode 84. Read literally, S03E01 matches nothing: the file parses as
+/// season 1 episode 84, and every season past the first answered "No Streams
+/// Found" while the origin held all 220 episodes.
+///
+/// Only a show whose earlier seasons are present in the meta can be mapped, and
+/// a season whose episodes already start at 1 maps to `sum(previous) + episode`.
+pub fn absolute_episode_from_videos(meta: &Value, season: i32, episode: i32) -> i32 {
+    if season < 1 || episode < 1 {
+        return 0;
+    }
+    let Some(videos) = meta.get("videos").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    let mut before: i32 = 0;
+    let mut this_min: i32 = i32::MAX;
+    let mut seen_season = false;
+    for video in videos {
+        let s = video.get("season").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let e = video
+            .get("episode")
+            .or_else(|| video.get("number"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        // Specials (season 0) are not part of the continuous run.
+        if s < 1 || e < 1 {
+            continue;
+        }
+        if s == season {
+            seen_season = true;
+            if e < this_min {
+                this_min = e;
+            }
+        }
+        if s < season {
+            before += 1;
+        }
+    }
+    if !seen_season || before == 0 {
+        return 0;
+    }
+    let offset = if this_min == i32::MAX || this_min <= 1 {
+        episode
+    } else {
+        episode - this_min + 1
+    };
+    if offset < 1 {
+        return 0;
+    }
+    before + offset
+}
+
+/// [`absolute_episode_from_videos()`] for a live item (same meta fetch/cache as
+/// [`episode_names()`]).
+pub async fn absolute_episode(
+    settings: &Value,
+    media_id: &str,
+    season: i32,
+    episode: i32,
+    expected_title: &str,
+    expected_year: &str,
+) -> i32 {
+    let media_id = strip_episode_suffix(media_id);
+    if media_id.is_empty() || season < 2 || episode < 1 {
+        return 0;
+    }
+    let mut urls: Vec<String> = Vec::new();
+    for up in resolver_manifests(settings)
+        .await
+        .into_iter()
+        .take(MAX_NAME_PROVIDERS)
+    {
+        let manifest = up.url.trim();
+        if manifest.is_empty() || !(manifest.starts_with("http://") || manifest.starts_with("https://")) {
+            continue;
+        }
+        urls.push(format!(
+            "{}/meta/series/{}.json",
+            base_of(manifest),
+            rawurlencode(&media_id)
+        ));
+    }
+    if urls.is_empty() {
+        return 0;
+    }
+    let bodies = futures_util::future::join_all(urls.iter().map(|url| {
+        let url = url.clone();
+        async move { crate::httpc::get_contents(&url, NAME_FETCH_TIMEOUT_SECS, HashMap::new()).await }
+    }))
+    .await;
+    for body in bodies.iter() {
+        let Some(text) = body else { continue };
+        let Ok(doc) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let meta = doc.get("meta").unwrap_or(&Value::Null);
+        if !meta.is_object()
+            || !episode_meta_identity_matches(meta, &media_id, expected_title, expected_year)
+        {
+            continue;
+        }
+        let abs = absolute_episode_from_videos(meta, season, episode);
+        if abs > 0 {
+            return abs;
+        }
+    }
+    0
+}
+
+/// Every episode title of `season` EXCEPT the requested episode, normalised and
+/// de-duplicated. Same field rules as [`extract_episode_names()`].
+pub fn extract_sibling_names(meta: &Value, season: i32, episode: i32) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let Some(videos) = meta.get("videos").and_then(|v| v.as_array()) else {
+        return names;
+    };
+    for video in videos {
+        if !video.is_object() {
+            continue;
+        }
+        let v_season = video.get("season").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        if v_season != season {
+            continue;
+        }
+        let v_episode = video
+            .get("episode")
+            .or_else(|| video.get("number"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        if v_episode == episode {
+            continue;
+        }
+        for field in ["name", "title"] {
+            let name = crate::matcher::normalize_episode_name(&s(video, field));
+            if !name.is_empty() && !placeholder_re().is_match(&name).unwrap_or(false) {
+                if !names.iter().any(|n| n == &name) {
+                    names.push(name);
+                }
+            }
+        }
+        if names.len() >= 80 {
+            break;
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,6 +1485,57 @@ mod tests {
         // A season-0 special must never answer a season-1 request.
         assert!(extract_episode_names(&meta, 1, 3).is_empty());
         assert!(extract_episode_names(&meta, 2, 1).is_empty());
+    }
+
+    /// Reported: Naruto **season 3** answered "No Streams Found" while the origin
+    /// held `Naruto.E84.mkv` — one continuous run, no season markers, against
+    /// theTVDB's 5-way split (S1 35, S2 48, S3 48 …).
+    #[test]
+    fn absolute_episode_counts_the_earlier_seasons() {
+        let mut videos: Vec<serde_json::Value> = Vec::new();
+        for e in 1..=35 {
+            videos.push(serde_json::json!({"season": 1, "episode": e}));
+        }
+        for e in 1..=48 {
+            videos.push(serde_json::json!({"season": 2, "episode": e}));
+        }
+        for e in 1..=48 {
+            videos.push(serde_json::json!({"season": 3, "episode": e}));
+        }
+        // A special must not shift the run.
+        videos.push(serde_json::json!({"season": 0, "episode": 1}));
+        let meta = serde_json::json!({"videos": videos});
+        assert_eq!(absolute_episode_from_videos(&meta, 3, 1), 84);
+        assert_eq!(absolute_episode_from_videos(&meta, 3, 48), 131);
+        assert_eq!(absolute_episode_from_videos(&meta, 2, 1), 36);
+        // Season 1 needs no mapping; a season the meta does not list is unmappable.
+        assert_eq!(absolute_episode_from_videos(&meta, 1, 5), 0);
+        assert_eq!(absolute_episode_from_videos(&meta, 4, 1), 0);
+        assert_eq!(absolute_episode_from_videos(&serde_json::json!({}), 3, 1), 0);
+    }
+
+    /// Reported: Black Clover season 2 listed season 1's files, and Naruto's
+    /// `kitsu:11:84` (S03E01) answered "No Streams Found". The addon's `name` is
+    /// the same ("Black Clover", "Naruto") whichever id you ask about, so the
+    /// ONLY evidence is the video entry: it carries both the season AND the
+    /// season-relative episode number.
+    #[test]
+    fn a_video_entry_knows_its_own_season() {
+        let meta = serde_json::json!({"videos": [
+            {"id": "kitsu:13209:16", "season": 1, "episode": 16, "title": "The Diamond Mage"},
+            {"id": "kitsu:50024:2", "season": 2, "episode": 2, "title": "The Door to Hell"},
+            {"id": "kitsu:11:84", "season": 3, "episode": 1, "title": "Roar, Chidori! Brother vs. Brother!"},
+        ]});
+        // An anime id's trailing number is ABSOLUTE; the entry says where it goes.
+        assert_eq!(video_season_episode_for_item(&meta, "kitsu:11:84"), Some((3, 1)));
+        assert_eq!(video_season_episode_for_item(&meta, "kitsu:50024:2"), Some((2, 2)));
+        assert_eq!(video_season_episode_for_item(&meta, "kitsu:13209:16"), Some((1, 16)));
+        // Case and whitespace are not identity.
+        assert_eq!(video_season_episode_for_item(&meta, " KITSU:50024:2 "), Some((2, 2)));
+        // An id the meta does not publish is not evidence.
+        assert_eq!(video_season_episode_for_item(&meta, "kitsu:50024:9"), None);
+        assert_eq!(video_season_episode_for_item(&serde_json::json!({}), "kitsu:1"), None);
+        assert_eq!(video_season_episode_for_item(&meta, ""), None);
     }
 
     #[test]
